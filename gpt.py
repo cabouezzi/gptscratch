@@ -173,6 +173,7 @@ def estimate_loss():
     return out
 
 
+# main function trains the model
 if __name__ == "__main__":
     m = Model()
     m = m.to(device)
