@@ -1,83 +1,146 @@
-import asyncio
 import torch
-from fastapi import FastAPI, Response
+import asyncio
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from sse_starlette.sse import EventSourceResponse
-from gpt import decode, Model, device
+from fastapi.middleware.cors import CORSMiddleware
+
+from gpt import Model, decode, device, block_size
 
 app = FastAPI()
 
+# --- CORS (required for React frontend) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- Load model ---
-checkpoint_path = "checkpoint.pt"
 model = Model().to(device)
-checkpoint = torch.load(checkpoint_path, map_location=device)
+checkpoint = torch.load("checkpoint.pt", map_location=device)
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-# --- Global state ---
-is_playing = False
-clients = []      # list of queues
+# --- Shared generation state ---
+state = {
+    "playing": False,
+    "context": torch.zeros((1, 1), dtype=torch.long, device=device),
+    "queue": asyncio.Queue(),  # tokens will be pushed here
+    "gen_task": None,  # reference to generation loop task
+}
 
+
+# ===============================================================
+# BACKGROUND TOKEN GENERATION LOOP
+# ===============================================================
+async def generation_loop():
+    """
+    Continuously generate tokens one at a time, respecting play/pause/reset.
+    Updates context after each token so generation continues properly.
+    """
+    try:
+        while state["playing"]:
+            idx = state["context"]
+            # Crop context to avoid position embedding overflow
+            idx_cropped = idx[:, -block_size:]
+            # Forward pass
+            logits, _ = model(idx_cropped)
+            logits = logits[:, -1, :]
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+            # Update context
+            idx = torch.cat((idx, idx_next), dim=1)
+            state["context"] = idx[:, -block_size:]  # crop to block_size
+
+            # Decode and push to SSE queue
+            decoded = decode([idx_next.item()])
+            await state["queue"].put(decoded)
+
+            # Throttle token generation
+            await asyncio.sleep(0.015)
+
+    except asyncio.CancelledError:
+        await asyncio.sleep(0.05)
+    except Exception as e:
+        print("Generation error:", e)
+        await asyncio.sleep(0.05)
+
+    await asyncio.sleep(0.05)
+
+
+# ===============================================================
+# PLAY / PAUSE
+# ===============================================================
 @app.post("/play")
 async def play():
-    global is_playing
-    is_playing = True
+    state["playing"] = True
+
+    # Start generation loop task if not running
+    if state.get("gen_task") is None or state["gen_task"].done():
+        state["gen_task"] = asyncio.create_task(generation_loop())
+
     return {"status": "playing"}
+
 
 @app.post("/pause")
 async def pause():
-    global is_playing
-    is_playing = False
+    state["playing"] = False
     return {"status": "paused"}
 
-@app.get("/stream")
-async def stream():
-    """
-    Stream tokens via Server-Sent Events (SSE).
-    Each client gets its own asyncio.Queue so broadcast is safe.
-    """
-    queue = asyncio.Queue()
-    clients.append(queue)
 
-    async def event_gen():
+# ===============================================================
+# RESET CONTEXT
+# ===============================================================
+@app.post("/reset")
+async def reset():
+    global state
+    # Stop generation task
+    state["playing"] = False
+    if state.get("gen_task") and not state["gen_task"].done():
+        state["gen_task"].cancel()
         try:
-            while True:
-                token = await queue.get()
-                yield {"data": token}
+            await state["gen_task"]
         except asyncio.CancelledError:
             pass
-        finally:
-            clients.remove(queue)
 
-    return EventSourceResponse(event_gen())
+    state = {
+        "playing": False,
+        "context": torch.zeros((1, 1), dtype=torch.long, device=device),
+        "queue": asyncio.Queue(),
+        "gen_task": None,
+    }
 
-
-async def token_generator():
-    """
-    Background task that continuously generates tokens and broadcasts them.
-    Only pushes tokens when is_playing == True
-    """
-    context = torch.zeros((1, 1), dtype=torch.long, device=device)
-
-    while True:
-        # Block until play is true
-        if not is_playing:
-            await asyncio.sleep(0.1)
-            continue
-
-        with torch.no_grad():
-            output = model.generate(context, max_tokens=1, stream=True)
-            for token in output:
-                text = decode([token.item()])
-                # broadcast to all connected clients
-                for q in clients:
-                    q.put_nowait(text)
-        await asyncio.sleep(0)  # yield control
+    return {"status": "reset"}
 
 
+# ===============================================================
+# STREAM (SSE)
+# ===============================================================
+@app.get("/stream")
+async def stream():
+    async def event_generator():
+        while True:
+            token = await state["queue"].get()
+            # preserve newlines properly for frontend
+            safe = token.replace("\n", "\\n")
+            print(safe, end="", flush=True)
+            yield f"data: {safe}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ===============================================================
+# Startup: optional warmup or just rely on play endpoint
+# ===============================================================
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(token_generator())
+    # We don't start generation until play is called
+    pass
 
 
-# run with uvicorn server:app --host 0.0.0.0 --port 8000
+# ===============================================================
+# Run: uvicorn server:app --host 0.0.0.0 --port 8000
+# ===============================================================
