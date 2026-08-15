@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from pathlib import Path
+
+from tokenizer import Tokenizer
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 # model params
@@ -16,11 +19,18 @@ eval_interval = 500
 learning_rate = 1e-4
 eval_iters = 200
 
-with open("input.txt", "r", encoding="utf-8") as f:
+project_dir = Path(__file__).resolve().parent
+with (project_dir / "input.txt").open("r", encoding="utf-8") as f:
     text = f.read()
 
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
+tokenizer_path = project_dir / "tokenizer.json"
+if not tokenizer_path.exists():
+    raise FileNotFoundError(
+        "tokenizer.json not found; run `python tokenizer.py input.txt` first"
+    )
+
+tokenizer = Tokenizer.load(tokenizer_path)
+vocab_size = tokenizer.vocab_size
 
 
 class Head(nn.Module):
@@ -137,10 +147,8 @@ class Model(nn.Module):
 
 
 # tokenizer
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: "".join([itos[i] for i in l])
+encode = tokenizer.encode
+decode = tokenizer.decode
 # split data
 data = torch.tensor(encode(text), dtype=torch.long)
 n = int(0.9 * len(data))

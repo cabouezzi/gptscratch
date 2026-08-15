@@ -1,10 +1,12 @@
+import codecs
+
 import torch
 import asyncio
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from gpt import Model, decode, device, block_size
+from gpt import Model, encode, tokenizer, device, block_size
 
 app = FastAPI()
 
@@ -26,7 +28,8 @@ model.eval()
 # --- Shared generation state ---
 state = {
     "playing": False,
-    "context": torch.zeros((1, 1), dtype=torch.long, device=device),
+    "context": torch.tensor([encode("\n")], dtype=torch.long, device=device),
+    "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
     "queue": asyncio.Queue(),  # tokens will be pushed here
     "gen_task": None,  # reference to generation loop task
 }
@@ -56,8 +59,11 @@ async def generation_loop():
             state["context"] = idx[:, -block_size:]  # crop to block_size
 
             # Decode and push to SSE queue
-            decoded = decode([idx_next.item()])
-            await state["queue"].put(decoded)
+            decoded = state["decoder"].decode(
+                tokenizer.decode_bytes([idx_next.item()])
+            )
+            if decoded:
+                await state["queue"].put(decoded)
 
             # Throttle token generation
             await asyncio.sleep(0.015)
@@ -108,7 +114,8 @@ async def reset():
 
     state = {
         "playing": False,
-        "context": torch.zeros((1, 1), dtype=torch.long, device=device),
+        "context": torch.tensor([encode("\n")], dtype=torch.long, device=device),
+        "decoder": codecs.getincrementaldecoder("utf-8")(errors="replace"),
         "queue": asyncio.Queue(),
         "gen_task": None,
     }
