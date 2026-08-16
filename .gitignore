@@ -1,29 +1,49 @@
-    # Byte-compiled / optimized / compiled files
-    __pycache__/
-    *.pyc
-    *.pyd
-    *.pyo
+# Byte-compiled / optimized / compiled files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
 
-    # Distribution / packaging
-    .Python/
-    build/
-    dist/
-    eggs/
-    *.egg-info/
-    .eggs/
+# Distribution / packaging
+.Python/
+build/
+dist/
+eggs/
+*.egg-info/
+.eggs/
 
-    # Environments
-    .env
-    venv/
-    env/
-    ENV/
+# Environments
+.env
+venv/
+env/
+ENV/
 
-    # Editors
-    .vscode/
-    .idea/
-    *.sublime-project
-    *.sublime-workspace
+# Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
 
-    # Logs and temporary files
-    *.log
-    *.tmp
+# Logs and temporary files
+*.log
+*.tmp
+
+# macOS metadata
+.DS_Store
+
+# Inference build output
+inference/builddir/
+inference/performance/build/
+
+# Meson and compiler output outside the standard build directories
+meson-info/
+meson-logs/
+meson-private/
+compile_commands.json
+*.ninja
+.ninja_*
+
+# Compiled Metal artifacts
+*.air
+*.metallib
+.metal-air/

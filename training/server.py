@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from gpt import Model, decode, device, block_size
+from training.gpt import Model, decode, device, block_size
 
 app = FastAPI()
 

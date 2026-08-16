@@ -1,0 +1,29 @@
+    # Byte-compiled / optimized / compiled files
+    __pycache__/
+    *.pyc
+    *.pyd
+    *.pyo
+
+    # Distribution / packaging
+    .Python/
+    build/
+    dist/
+    eggs/
+    *.egg-info/
+    .eggs/
+
+    # Environments
+    .env
+    venv/
+    env/
+    ENV/
+
+    # Editors
+    .vscode/
+    .idea/
+    *.sublime-project
+    *.sublime-workspace
+
+    # Logs and temporary files
+    *.log
+    *.tmp

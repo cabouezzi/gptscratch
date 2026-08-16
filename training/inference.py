@@ -1,5 +1,5 @@
 import torch
-from gpt import decode, Model, device
+from training.gpt import decode, Model, device
 
 checkpoint_path = "checkpoint.pt"
 
