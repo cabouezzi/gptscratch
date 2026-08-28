@@ -1,24 +1,18 @@
 #pragma once
 
-#include <vector>
-#include "model.hpp"
+#include <cstddef>
+
+#include "export.hpp"
 
 namespace inference {
 
-class Head {
+INFERENCE_PUBLIC void scaled_dot_product_attention(
+    const float* Q,       // Shape: [seq_len, head_size]
+    const float* K,       // Shape: [seq_len, head_size]
+    const float* V,       // Shape: [seq_len, head_size]
+    float*& output,       // Shape: [seq_len, head_size]
+    std::size_t seq_len,
+    std::size_t head_size
+);
 
-public:
-  Head(int embed_size, int head_size);
-  std::vector<std::vector<float>> forward(std::vector<std::vector<float>> X);
-
-private:
-  int embed_size;
-  int head_size;
-
-  std::vector<std::vector<float>> Q;  // (embed size, head size)
-  std::vector<std::vector<float>> K;  // (embed size, head size)
-  std::vector<std::vector<float>> V;  // (embed size, head size)
-
-};
-
-}
+} // namespace inference

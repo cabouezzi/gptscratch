@@ -1,17 +1,15 @@
 # Performance tests
 
-Run the matmul comparison from the project root:
+Build and run the GPU benchmark from the project root:
 
 ```sh
-./performance/run.py
+meson compile -C builddir matmul_performance
+./builddir/performance/matmul_performance
 ```
 
-The run builds the CPU implementation with `-O1`, compares it with the Metal
-implementation, prints a Markdown table, and writes the same table to
-`performance/results.md`.
+It prints the results directly as a Markdown table. The VS Code **Run Matmul
+Performance** launch configuration builds and runs this same target.
 
-Each normal cell is the median of five samples in milliseconds per `matmul`
-call. The dense `4096x4096 * 4096x4096` case uses one sample because it performs
-about 68.7 billion multiply-accumulate steps per implementation. The
+Each row reports the median GPU time in milliseconds per `matmul` call. The
 measurement includes the current API's input copies, output allocation, and
 caller-side `free`.

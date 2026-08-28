@@ -1,0 +1,7 @@
+#pragma once
+
+struct MatrixDims {
+    uint M;
+    uint K;
+    uint N;
+};

@@ -29,14 +29,13 @@
             "name": "Run Matmul Performance",
             "type": "cppdbg",
             "request": "launch",
-            "program": "/opt/homebrew/bin/python3",
-            "args": [
-                "${workspaceFolder}/performance/run.py"
-            ],
+            "program": "${workspaceFolder}/builddir/performance/matmul_performance",
+            "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "externalConsole": false,
-            "MIMode": "lldb"
+            "MIMode": "lldb",
+            "preLaunchTask": "Meson: Build inference"
         }
     ]
 }

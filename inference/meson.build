@@ -39,11 +39,12 @@ inference_metallib = metal_artifacts
 lib_args = ['-DBUILDING_INFERENCE']
 
 matmul_source = files('src/cpu/matmul.cpp')
+attention_source = files('src/cpu/attention.cpp')
 metal_backend_source = files('src/metal/backend.cpp')
 sources = files(
   'src/model.cpp',
   'src/tokenizer.cpp',
-) + matmul_source + metal_backend_source
+) + matmul_source + attention_source + metal_backend_source
 
 lib = library(
   'inference',
