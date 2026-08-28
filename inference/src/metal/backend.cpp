@@ -180,11 +180,12 @@ float *scaled_dot_product_attention_metal(const float *Q, const float *K,
                                           const float *V,
                                           std::size_t seq_len,
                                           std::size_t head_size,
+                                          std::size_t num_heads,
                                           bool isCausal) {
   if (Q == nullptr || K == nullptr || V == nullptr) {
     throw std::invalid_argument("Metal attention inputs cannot be null");
   }
-  if (seq_len == 0 || head_size == 0) {
+  if (seq_len == 0 || head_size == 0 || num_heads == 0) {
     throw std::invalid_argument("Metal attention dimensions must be positive");
   }
   if (seq_len % 64 != 0) {
@@ -199,7 +200,12 @@ float *scaled_dot_product_attention_metal(const float *Q, const float *K,
     throw std::overflow_error("Metal attention buffer size overflow");
   }
 
-  std::size_t element_count = seq_len * head_size;
+  std::size_t elements_per_head = seq_len * head_size;
+  if (num_heads >
+      std::numeric_limits<std::size_t>::max() / elements_per_head) {
+    throw std::overflow_error("Metal attention buffer size overflow");
+  }
+  std::size_t element_count = num_heads * elements_per_head;
   std::size_t buffer_size = element_count * sizeof(float);
   NS::AutoreleasePool *pool = NS::AutoreleasePool::alloc()->init();
   MTL::Device *device = MTL::CreateSystemDefaultDevice();
@@ -286,7 +292,7 @@ float *scaled_dot_product_attention_metal(const float *Q, const float *K,
   encoder->setBuffer(bufO, 0, 3);
   encoder->setBytes(&dims, sizeof(dims), 4);
   encoder->setBytes(&isCausal, sizeof(isCausal), 5);
-  encoder->dispatchThreadgroups(MTL::Size(seq_len, 1, 1),
+  encoder->dispatchThreadgroups(MTL::Size(seq_len, num_heads, 1),
                                 MTL::Size(32, 1, 1));
   encoder->endEncoding();
   command_buffer->commit();

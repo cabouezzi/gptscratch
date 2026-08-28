@@ -21,16 +21,21 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
                    constant MatrixDims& dims    [[buffer(4)]],
                    constant bool& isCausal [[buffer(5)]],
                    // each threadblock is one row of Q
-                   uint rowId [[threadgroup_position_in_grid]],
+                   // updated to 2D to handle multiple attention heads
+                   uint2 threadgroupId [[threadgroup_position_in_grid]],
                    uint laneId [[thread_index_in_simdgroup]])
 {
+    uint rowId = threadgroupId.x;
+    uint headId = threadgroupId.y;
     constexpr uint TILE_K = 64;
     // 64 / 4. tryna see how can i make this a variable to pass so im not constrained here
     constexpr uint VECTORS_PER_ROW = 16;
     const uint d = dims.K;
+    const uint head_offset = dims.N * d;
     const bool active = laneId < VECTORS_PER_ROW;
 
-    device const float4* row_ptr = reinterpret_cast<device const float4*>(Q + (rowId * d));
+    device const float4* row_ptr = reinterpret_cast<device const float4*>(
+        Q + (headId * head_offset) + (rowId * d));
     float4 q_register = active ? row_ptr[laneId] : float4(0.0f);
 
     threadgroup float4 tileK[TILE_K][VECTORS_PER_ROW];
@@ -44,8 +49,8 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
 
     for (uint kv_tile = 0; kv_tile < NUM_KV_TILES; kv_tile++) {
         uint tile_offset = kv_tile * TILE_FLOAT4S;
-        device const float4* K4 = reinterpret_cast<device const float4*>(K);
-        device const float4* V4 = reinterpret_cast<device const float4*>(V);
+        device const float4* K4 = reinterpret_cast<device const float4*>(K + (headId * head_offset));
+        device const float4* V4 = reinterpret_cast<device const float4*>(V + (headId * head_offset));
         load_tile_to_threadgroup(K4 + tile_offset, &tileK[0][0], laneId, TILE_FLOAT4S);
         load_tile_to_threadgroup(V4 + tile_offset, &tileV[0][0], laneId, TILE_FLOAT4S);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -98,7 +103,7 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
 
     if (active) {
         o_acc /= d_prev;
-        device float4* out_ptr = reinterpret_cast<device float4*>(O + (rowId * d));
+        device float4* out_ptr = reinterpret_cast<device float4*>(O + (headId * head_offset) + (rowId * d));
         out_ptr[laneId] = o_acc;
     }
 }

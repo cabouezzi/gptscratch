@@ -15,6 +15,6 @@ INFERENCE_PUBLIC float *matmul_metal(std::vector<std::vector<float>> const X,
                                      MatMulFlag flagY, bool tile);
 INFERENCE_PUBLIC float *scaled_dot_product_attention_metal(
     const float *Q, const float *K, const float *V, std::size_t seq_len,
-    std::size_t head_size, bool isCausal);
+    std::size_t head_size, std::size_t num_heads, bool isCausal);
 
 } // namespace inference
