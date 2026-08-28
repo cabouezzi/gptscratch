@@ -617,6 +617,125 @@ TEST_CASE("Metal multi-head attention handles eight heads",
       num_heads, sequence_length, head_size);
 }
 
+TEST_CASE("Metal attention supports a partial key-value tile",
+          "[metal][attention][padding][edge]") {
+  constexpr std::size_t sequence_length = 11;
+  constexpr std::size_t head_size = 64;
+  std::vector<float> Q =
+      make_attention_input(sequence_length, head_size, 3, 13.0F);
+  std::vector<float> K =
+      make_attention_input(sequence_length, head_size, 11, 17.0F);
+  std::vector<float> V =
+      make_attention_input(sequence_length, head_size, 23, 9.0F);
+
+  SECTION("non-causal") {
+    require_attention_close(
+        run_metal_attention(Q, K, V, sequence_length, head_size, false),
+        attention_reference(Q, K, V, sequence_length, head_size, false),
+        head_size);
+  }
+
+  SECTION("causal") {
+    require_attention_close(
+        run_metal_attention(Q, K, V, sequence_length, head_size, true),
+        attention_reference(Q, K, V, sequence_length, head_size, true),
+        head_size);
+  }
+}
+
+TEST_CASE("Metal attention supports vector-aligned head sizes",
+          "[metal][attention][padding][head-size]") {
+  struct AttentionShape {
+    std::size_t sequenceLength;
+    std::size_t headSize;
+    std::size_t numHeads;
+    bool isCausal;
+  };
+
+  const std::vector<AttentionShape> shapes{
+      {1, 4, 1, false},   {2, 8, 2, true},    {7, 12, 3, false},
+      {11, 16, 2, true},  {31, 20, 4, false}, {63, 32, 2, true},
+      {64, 48, 3, false}, {65, 60, 2, true},  {70, 4, 8, false},
+      {127, 16, 2, true}, {129, 32, 3, false},
+      {192, 64, 4, true},
+  };
+
+  for (const AttentionShape &shape : shapes) {
+    DYNAMIC_SECTION("sequence=" << shape.sequenceLength
+                                  << " head_size=" << shape.headSize
+                                  << " heads=" << shape.numHeads
+                                  << " causal=" << shape.isCausal) {
+      std::vector<float> Q = make_multihead_attention_input(
+          shape.numHeads, shape.sequenceLength, shape.headSize, 3, 13.0F);
+      std::vector<float> K = make_multihead_attention_input(
+          shape.numHeads, shape.sequenceLength, shape.headSize, 11, 17.0F);
+      std::vector<float> V = make_multihead_attention_input(
+          shape.numHeads, shape.sequenceLength, shape.headSize, 23, 9.0F);
+
+      require_multihead_attention_close(
+          run_metal_attention(Q, K, V, shape.sequenceLength, shape.headSize,
+                              shape.isCausal, shape.numHeads),
+          attention_reference(Q, K, V, shape.sequenceLength, shape.headSize,
+                              shape.isCausal, shape.numHeads),
+          shape.numHeads, shape.sequenceLength, shape.headSize);
+    }
+  }
+}
+
+TEST_CASE("Metal attention excludes padded keys for smaller heads",
+          "[metal][attention][padding][head-size][softmax]") {
+  struct AttentionShape {
+    std::size_t sequenceLength;
+    std::size_t headSize;
+    std::size_t numHeads;
+    bool isCausal;
+  };
+
+  const std::vector<AttentionShape> shapes{
+      {11, 4, 2, false},
+      {11, 4, 2, true},
+      {65, 60, 3, false},
+      {65, 60, 3, true},
+  };
+
+  for (const AttentionShape &shape : shapes) {
+    DYNAMIC_SECTION("sequence=" << shape.sequenceLength
+                                  << " head_size=" << shape.headSize
+                                  << " heads=" << shape.numHeads
+                                  << " causal=" << shape.isCausal) {
+      const std::size_t elementsPerHead =
+          shape.sequenceLength * shape.headSize;
+      std::vector<float> Q(shape.numHeads * elementsPerHead, 0.0F);
+      std::vector<float> K(shape.numHeads * elementsPerHead, 0.0F);
+      std::vector<float> V(shape.numHeads * elementsPerHead);
+      std::vector<float> expected(shape.numHeads * elementsPerHead);
+
+      for (std::size_t head = 0; head < shape.numHeads; head++) {
+        const float headValue = static_cast<float>(head) * 100.0F;
+        for (std::size_t row = 0; row < shape.sequenceLength; row++) {
+          for (std::size_t column = 0; column < shape.headSize; column++) {
+            const std::size_t index =
+                head * elementsPerHead + row * shape.headSize + column;
+            V[index] = headValue + static_cast<float>(row) +
+                       static_cast<float>(column) * 0.015625F;
+            const float averageRow =
+                shape.isCausal ? static_cast<float>(row) * 0.5F
+                               : static_cast<float>(shape.sequenceLength - 1) *
+                                     0.5F;
+            expected[index] = headValue + averageRow +
+                              static_cast<float>(column) * 0.015625F;
+          }
+        }
+      }
+
+      require_multihead_attention_close(
+          run_metal_attention(Q, K, V, shape.sequenceLength, shape.headSize,
+                              shape.isCausal, shape.numHeads),
+          expected, shape.numHeads, shape.sequenceLength, shape.headSize);
+    }
+  }
+}
+
 TEST_CASE("Metal attention validates inputs", "[metal][attention][validation]") {
   float value = 0.0F;
 
@@ -647,12 +766,6 @@ TEST_CASE("Metal attention validates inputs", "[metal][attention][validation]") 
   SECTION("head size is zero") {
     CHECK_THROWS_AS(inference::scaled_dot_product_attention_metal(
                         &value, &value, &value, 64, 0, 1, false),
-                    std::invalid_argument);
-  }
-
-  SECTION("sequence length is not a complete tile") {
-    CHECK_THROWS_AS(inference::scaled_dot_product_attention_metal(
-                        &value, &value, &value, 65, 64, 1, false),
                     std::invalid_argument);
   }
 

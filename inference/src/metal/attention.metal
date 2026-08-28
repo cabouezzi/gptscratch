@@ -2,14 +2,26 @@
 #include "types.metalh"
 using namespace metal;
 
+constant uint TILE_K = 64;
+constant uint VECTORS_PER_ROW = 16;
+constant uint THREADGROUP_SIZE = 32;
+constant uint TILE_FLOAT4S = TILE_K * VECTORS_PER_ROW;
+
 inline void load_tile_to_threadgroup(
     device const float4*  src_global,
     threadgroup float4*   dst_shared, 
     uint                  laneId,
-    uint                  total_float4s
+    uint                  boundedRowCount,
+    uint                  vectorsPerRow
 ) {
-    for (uint i = laneId; i < total_float4s; i += 32 /* threadgroup size */) {
-        dst_shared[i] = src_global[i];
+    for (uint i = laneId; i < TILE_FLOAT4S; i += THREADGROUP_SIZE) {
+        uint tileRow = i / VECTORS_PER_ROW;
+        uint vectorColumn = i % VECTORS_PER_ROW;
+        if (tileRow < boundedRowCount && vectorColumn < vectorsPerRow) {
+            dst_shared[i] = src_global[(tileRow * vectorsPerRow) + vectorColumn];
+        } else {
+            dst_shared[i] = float4(0.0f);
+        }
     }
 }
 
@@ -27,12 +39,10 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
 {
     uint rowId = threadgroupId.x;
     uint headId = threadgroupId.y;
-    constexpr uint TILE_K = 64;
-    // 64 / 4. tryna see how can i make this a variable to pass so im not constrained here
-    constexpr uint VECTORS_PER_ROW = 16;
     const uint d = dims.K;
     const uint head_offset = dims.N * d;
-    const bool active = laneId < VECTORS_PER_ROW;
+    const uint vectorsPerRow = d / 4;
+    const bool active = laneId < vectorsPerRow;
 
     device const float4* row_ptr = reinterpret_cast<device const float4*>(
         Q + (headId * head_offset) + (rowId * d));
@@ -40,19 +50,20 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
 
     threadgroup float4 tileK[TILE_K][VECTORS_PER_ROW];
     threadgroup float4 tileV[TILE_K][VECTORS_PER_ROW];
-    const uint TILE_FLOAT4S = TILE_K * (d / 4);
-    const uint NUM_KV_TILES = dims.N / TILE_K;
+    const uint NUM_KV_TILES = (dims.N + TILE_K - 1) / TILE_K;
 
     float m_prev = -INFINITY;
     float d_prev = 0.0f;
     float4 o_acc = float4(0.0f);
 
     for (uint kv_tile = 0; kv_tile < NUM_KV_TILES; kv_tile++) {
-        uint tile_offset = kv_tile * TILE_FLOAT4S;
+        uint tileStart = kv_tile * TILE_K;
+        uint boundedRowCount = min(TILE_K, dims.N - tileStart);
+        uint tileOffset = tileStart * vectorsPerRow;
         device const float4* K4 = reinterpret_cast<device const float4*>(K + (headId * head_offset));
         device const float4* V4 = reinterpret_cast<device const float4*>(V + (headId * head_offset));
-        load_tile_to_threadgroup(K4 + tile_offset, &tileK[0][0], laneId, TILE_FLOAT4S);
-        load_tile_to_threadgroup(V4 + tile_offset, &tileV[0][0], laneId, TILE_FLOAT4S);
+        load_tile_to_threadgroup(K4 + tileOffset, &tileK[0][0], laneId, boundedRowCount, vectorsPerRow);
+        load_tile_to_threadgroup(V4 + tileOffset, &tileV[0][0], laneId, boundedRowCount, vectorsPerRow);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // calculate Q_i K_i^T
@@ -67,7 +78,8 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
             float partial_dot = dot(q_register, k_reg);
             float score = simd_sum(partial_dot);  // look into simd in the GPU its different from CPU o.O
             uint keyRow = (kv_tile * TILE_K) + j;
-            bool visible = !isCausal || keyRow <= rowId;
+            bool validKey = keyRow < dims.N;
+            bool visible = validKey && (!isCausal || keyRow <= rowId);
             scores[j] = visible ? score * scale : -INFINITY;
         }
 

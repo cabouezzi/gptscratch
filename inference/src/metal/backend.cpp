@@ -188,10 +188,6 @@ float *scaled_dot_product_attention_metal(const float *Q, const float *K,
   if (seq_len == 0 || head_size == 0 || num_heads == 0) {
     throw std::invalid_argument("Metal attention dimensions must be positive");
   }
-  if (seq_len % 64 != 0) {
-    throw std::invalid_argument(
-        "Metal attention currently requires seq_len to be divisible by 64");
-  }
   if (seq_len > std::numeric_limits<std::uint32_t>::max() ||
       head_size > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Metal attention dimensions exceed uint32_t");
