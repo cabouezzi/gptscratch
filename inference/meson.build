@@ -41,10 +41,12 @@ lib_args = ['-DBUILDING_INFERENCE']
 matmul_source = files('src/cpu/matmul.cpp')
 attention_source = files('src/cpu/attention.cpp')
 metal_backend_source = files('src/metal/backend.cpp')
+kv_cache_source = files('src/metal/kv_cache.cpp')
 sources = files(
   'src/model.cpp',
+  'src/model_loader.cpp',
   'src/tokenizer.cpp',
-) + matmul_source + attention_source + metal_backend_source
+) + matmul_source + attention_source + metal_backend_source + kv_cache_source
 
 lib = library(
   'inference',
@@ -65,16 +67,35 @@ app_exe = executable(
   link_depends : inference_metallib,
 )
 
+generate_exe = executable(
+  'generate_tokens',
+  'generate_tokens.cpp',
+  include_directories : project_includes,
+  dependencies : dependencies,
+  link_with : lib,
+  link_depends : inference_metallib,
+)
+
 test_exe = executable(
   'inference_test',
   [
     'inference_test.cpp',
+    'tests/model.cpp',
+    'tests/model_loader.cpp',
+    'tests/tokenizer.cpp',
     'tests/cpu/matmul.cpp',
+    'tests/metal/bias.cpp',
+    'tests/metal/cache.cpp',
     'tests/metal/matmul.cpp',
+    'tests/metal/relu.cpp',
+    'tests/metal/residual.cpp',
     'src/cpu/matmul.cpp',
     'src/metal/backend.cpp',
   ],
   include_directories : [project_includes, metal_cpp_includes],
+  cpp_args : [
+    '-DINFERENCE_SOURCE_ROOT="' + meson.project_source_root() + '"',
+  ],
   dependencies : dependencies + [catch2_dep],
   link_with : lib,
   link_depends : inference_metallib,
@@ -97,7 +118,9 @@ install_headers(
   'include/export.hpp',
   'include/inference.hpp',
   'include/metal/backend.hpp',
+  'include/metal/kv_cache.hpp',
   'include/model.hpp',
+  'include/model_loader.hpp',
   'include/tokenizer.hpp',
 )
 

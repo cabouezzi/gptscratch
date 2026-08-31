@@ -5,3 +5,11 @@ struct MatrixDims {
     uint K;
     uint N;
 };
+
+struct AttentionDims {
+    uint queryLength;
+    uint keyValueLength;
+    uint headSize;
+    uint cacheCapacity;
+    uint queryStartPosition;
+};

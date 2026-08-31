@@ -1,4 +1,4 @@
-matmul_performance_sources = files('cpu/matmul.cpp') + matmul_source + metal_backend_source
+matmul_performance_sources = files('cpu/matmul.cpp') + matmul_source + metal_backend_source + kv_cache_source
 
 performance_metal_artifacts = custom_target(
   'performance-metallib',
@@ -13,6 +13,19 @@ executable(
   matmul_performance_sources,
   include_directories : [project_includes, metal_cpp_includes],
   dependencies : dependencies,
+  link_depends : performance_metallib,
+  install : false,
+)
+
+executable(
+  'decode_command_buffer_performance',
+  'model/decode.cpp',
+  include_directories : project_includes,
+  cpp_args : [
+    '-DINFERENCE_SOURCE_ROOT="' + meson.project_source_root() + '"',
+  ],
+  dependencies : dependencies,
+  link_with : lib,
   link_depends : performance_metallib,
   install : false,
 )

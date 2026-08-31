@@ -1,11 +1,29 @@
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 #include <tokenizer.hpp>
 #include <utility>
 
 namespace inference {
 
-Tokenizer::Tokenizer() = default;
+namespace {
+
+constexpr std::string_view TRAINING_VOCABULARY =
+    "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+} // namespace
+
+Tokenizer::Tokenizer() {
+  this->char_to_id.reserve(TRAINING_VOCABULARY.size());
+  this->id_to_char.reserve(TRAINING_VOCABULARY.size());
+
+  for (std::size_t id = 0; id < TRAINING_VOCABULARY.size(); id++) {
+    unsigned char character =
+        static_cast<unsigned char>(TRAINING_VOCABULARY[id]);
+    this->char_to_id.emplace(character, static_cast<int>(id));
+    this->id_to_char.push_back(character);
+  }
+}
 
 std::vector<int> Tokenizer::encode(std::string input) {
   std::vector<int> tokens;

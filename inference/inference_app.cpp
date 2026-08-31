@@ -2,9 +2,8 @@
 #include <iostream>
 
 int main() {
-    inference::Model model = inference::Model(8, 8);
+    inference::Model model = inference::Model("resources/model.gguf");
     inference::Tokenizer tokenizer = inference::Tokenizer();
-    tokenizer.load("resources/tokenizer.txt");
     std::vector<int> tokens = tokenizer.encode("fuck you");
     for (int token : tokens) {
         std::cout << token << ' ';

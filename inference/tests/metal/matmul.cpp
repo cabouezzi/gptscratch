@@ -221,7 +221,9 @@ std::vector<float> attention_reference(const std::vector<float> &Q,
           weighted_value +=
               scores[key] * V[head_offset + key * head_size + column];
         }
-        output[head_offset + query * head_size + column] =
+        const std::size_t output_index =
+            query * num_heads * head_size + head * head_size + column;
+        output[output_index] =
             weighted_value / denominator;
       }
     }
@@ -252,16 +254,15 @@ void require_multihead_attention_close(const std::vector<float> &received,
                                        std::size_t sequence_length,
                                        std::size_t head_size) {
   REQUIRE(received.size() == expected.size());
-  const std::size_t elements_per_head = sequence_length * head_size;
-
   for (std::size_t index = 0; index < expected.size(); index++) {
     if (!std::isfinite(received[index]) ||
         std::fabs(received[index] - expected[index]) > 0.001F) {
-      const std::size_t head = index / elements_per_head;
-      const std::size_t index_within_head = index % elements_per_head;
+      const std::size_t values_per_row = num_heads * head_size;
+      const std::size_t index_within_row = index % values_per_row;
+      const std::size_t head = index_within_row / head_size;
       INFO("head: " << head << " of " << num_heads);
-      INFO("row: " << index_within_head / head_size);
-      INFO("column: " << index_within_head % head_size);
+      INFO("row: " << index / values_per_row << " of " << sequence_length);
+      INFO("column: " << index_within_row % head_size);
       INFO("received: " << received[index]);
       INFO("expected: " << expected[index]);
       FAIL("Metal multi-head attention differs from expected attention");
@@ -311,6 +312,61 @@ TEST_CASE("Metal naïve handles zero and fractional values",
   Matrix expected{2, 2, {-1.0F, 7.0F, 8.5F, -2.0F}};
 
   CHECK(multiply_metal(X, Y, false) == expected);
+}
+
+TEST_CASE("Metal tiled matmul accepts pointer inputs",
+          "[metal][matmul][pointer]") {
+  const float A[]{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
+  const float B[]{7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F};
+  const std::vector<float> expected{58.0F, 64.0F, 139.0F, 154.0F};
+
+  float *output = inference::matmul_metal(
+      A, inference::MatMulFlag::NO_TRANSPOSE, B,
+      inference::MatMulFlag::NO_TRANSPOSE, 2, 3, 2, true);
+  REQUIRE(output != nullptr);
+
+  for (std::size_t index = 0; index < expected.size(); index++) {
+    CAPTURE(index);
+    CHECK(std::fabs(output[index] - expected[index]) < 0.00001F);
+  }
+
+  std::free(output);
+}
+
+TEST_CASE("Metal matmul ping-pongs between regions of one buffer",
+          "[metal][matmul][ping-pong]") {
+  inference::MetalContext context;
+  constexpr std::size_t matrixByteCount = 4 * sizeof(float);
+  constexpr std::size_t scratchAOffset = 0;
+  constexpr std::size_t scratchBOffset = matrixByteCount;
+  constexpr std::size_t weightOffset = matrixByteCount * 2;
+  constexpr std::size_t bufferByteCount = matrixByteCount * 3;
+  const float input[]{1.0F, 2.0F, 3.0F, 4.0F};
+  const float identity[]{1.0F, 0.0F, 0.0F, 1.0F};
+
+  MTL::Buffer *buffer =
+      inference::allocate_metal_buffer(context, bufferByteCount);
+  inference::write_metal_buffer(buffer, scratchAOffset, input, 4);
+  inference::write_metal_buffer(buffer, weightOffset, identity, 4);
+
+  inference::matmul_metal(
+      context, buffer, scratchAOffset,
+      inference::MatMulFlag::NO_TRANSPOSE, weightOffset,
+      inference::MatMulFlag::NO_TRANSPOSE, scratchBOffset, 2, 2, 2, true);
+  inference::matmul_metal(
+      context, buffer, scratchBOffset,
+      inference::MatMulFlag::NO_TRANSPOSE, weightOffset,
+      inference::MatMulFlag::NO_TRANSPOSE, scratchAOffset, 2, 2, 2, true);
+
+  float *output =
+      inference::read_metal_buffer(buffer, scratchAOffset, 4);
+  for (std::size_t index = 0; index < 4; index++) {
+    CAPTURE(index);
+    CHECK(output[index] == input[index]);
+  }
+
+  std::free(output);
+  inference::release_metal_buffer(buffer);
 }
 
 TEST_CASE("Metal matmul rejects incompatible shapes",
@@ -488,7 +544,7 @@ TEST_CASE("Metal causal attention masks across key-value tile boundaries",
       head_size);
 }
 
-TEST_CASE("Metal multi-head attention keeps packed outputs separate",
+TEST_CASE("Metal multi-head attention concatenates heads per token",
           "[metal][attention][multihead][layout]") {
   constexpr std::size_t num_heads = 3;
   constexpr std::size_t sequence_length = 64;
@@ -505,10 +561,12 @@ TEST_CASE("Metal multi-head attention keeps packed outputs separate",
       for (std::size_t column = 0; column < head_size; column++) {
         const std::size_t index =
             head * elements_per_head + row * head_size + column;
+        const std::size_t output_index =
+            row * num_heads * head_size + head * head_size + column;
         V[index] = head_value + static_cast<float>(row) * 0.5F +
                    static_cast<float>(column) * 0.015625F;
-        expected[index] = head_value + 15.75F +
-                          static_cast<float>(column) * 0.015625F;
+        expected[output_index] = head_value + 15.75F +
+                                 static_cast<float>(column) * 0.015625F;
       }
     }
   }
@@ -585,8 +643,11 @@ TEST_CASE("Metal multi-head causal attention crosses key-value tile boundaries",
       for (std::size_t column = 0; column < head_size; column++) {
         const std::size_t index =
             head * elements_per_head + row * head_size + column;
+        const std::size_t output_index =
+            row * num_heads * head_size + head * head_size + column;
         V[index] = head_value + static_cast<float>(row);
-        expected[index] = head_value + static_cast<float>(row) * 0.5F;
+        expected[output_index] =
+            head_value + static_cast<float>(row) * 0.5F;
       }
     }
   }
@@ -716,14 +777,17 @@ TEST_CASE("Metal attention excludes padded keys for smaller heads",
           for (std::size_t column = 0; column < shape.headSize; column++) {
             const std::size_t index =
                 head * elementsPerHead + row * shape.headSize + column;
+            const std::size_t outputIndex =
+                row * shape.numHeads * shape.headSize +
+                head * shape.headSize + column;
             V[index] = headValue + static_cast<float>(row) +
                        static_cast<float>(column) * 0.015625F;
             const float averageRow =
                 shape.isCausal ? static_cast<float>(row) * 0.5F
                                : static_cast<float>(shape.sequenceLength - 1) *
                                      0.5F;
-            expected[index] = headValue + averageRow +
-                              static_cast<float>(column) * 0.015625F;
+            expected[outputIndex] = headValue + averageRow +
+                                    static_cast<float>(column) * 0.015625F;
           }
         }
       }
