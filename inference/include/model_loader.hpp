@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -32,9 +34,12 @@ public:
   const float *data(const std::string &name) const;
   const GGUFMetadataValue &metadata(const std::string &key) const;
   const std::unordered_map<std::string, GGUFTensor> &allTensors() const;
+  void saveGGUF(const std::filesystem::path &path, const std::unordered_map<std::string, std::vector<float>> &tensorData) const;
+  void saveGGUF(const std::filesystem::path &path, const std::function<std::vector<float>(const std::string &, const GGUFTensor &)> &tensorReader) const;
 
 private:
-  std::vector<std::uint8_t> fileData;
+  struct MappedFileData;
+  std::shared_ptr<MappedFileData> fileData;
   std::unordered_map<std::string, GGUFTensor> tensors;
   std::unordered_map<std::string, GGUFMetadataValue> metadataValues;
 };

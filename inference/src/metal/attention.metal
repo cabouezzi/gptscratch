@@ -36,19 +36,22 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
                    constant uint& scaleSize [[buffer(7)]],
                    // each threadblock is one row of Q
                    // updated to 2D to handle multiple attention heads
-                   uint2 threadgroupId [[threadgroup_position_in_grid]],
+                   uint3 threadgroupId [[threadgroup_position_in_grid]],
                    uint laneId [[thread_index_in_simdgroup]])
 {
     uint rowId = threadgroupId.x;
     uint headId = threadgroupId.y;
+    uint batchId = threadgroupId.z;
     const uint d = dims.headSize;
-    const uint queryHeadOffset = dims.queryLength * d;
-    const uint cacheHeadOffset = dims.cacheCapacity * d;
+    const uint queryBatchOffset = dims.queryLength * d;
+    const uint cacheBatchOffset = dims.cacheCapacity * d;
+    const uint queryHeadOffset = dims.batchSize * queryBatchOffset;
+    const uint cacheHeadOffset = dims.batchSize * cacheBatchOffset;
     const uint vectorsPerRow = d / 4;
     const bool active = laneId < vectorsPerRow;
 
     device const float4* row_ptr = reinterpret_cast<device const float4*>(
-        Q + (headId * queryHeadOffset) + (rowId * d));
+        Q + (headId * queryHeadOffset) + (batchId * queryBatchOffset) + (rowId * d));
     float4 q_register = active ? row_ptr[laneId] : float4(0.0f);
 
     threadgroup float4 tileK[TILE_K][VECTORS_PER_ROW];
@@ -65,8 +68,8 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
         uint boundedRowCount =
             min(TILE_K, dims.keyValueLength - tileStart);
         uint tileOffset = tileStart * vectorsPerRow;
-        device const float4* K4 = reinterpret_cast<device const float4*>(K + (headId * cacheHeadOffset));
-        device const float4* V4 = reinterpret_cast<device const float4*>(V + (headId * cacheHeadOffset));
+        device const float4* K4 = reinterpret_cast<device const float4*>(K + (headId * cacheHeadOffset) + (batchId * cacheBatchOffset));
+        device const float4* V4 = reinterpret_cast<device const float4*>(V + (headId * cacheHeadOffset) + (batchId * cacheBatchOffset));
         load_tile_to_threadgroup(K4 + tileOffset, &tileK[0][0], laneId, boundedRowCount, vectorsPerRow);
         load_tile_to_threadgroup(V4 + tileOffset, &tileV[0][0], laneId, boundedRowCount, vectorsPerRow);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -122,7 +125,7 @@ kernel void scaled_dot_product_attention(device const float* Q [[buffer(0)]],
 
     if (active) {
         o_acc /= d_prev;
-        uint outputOffset = (rowId * numHeads * d) + (headId * d);
+        uint outputOffset = (((batchId * dims.queryLength) + rowId) * numHeads * d) + (headId * d);
         device float4* out_ptr = reinterpret_cast<device float4*>(O + outputOffset);
         out_ptr[laneId] = o_acc;
     }

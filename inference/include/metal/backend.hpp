@@ -54,6 +54,12 @@ public:
                  MTL::Buffer *weightBuffer, std::size_t weightOffset,
                  MTL::Buffer *outputBuffer, std::size_t outputOffset,
                  std::size_t inputSize, std::size_t outputSize);
+  void matmul(MTL::Buffer *aBuffer, std::size_t aOffset,
+              MatMulFlag flagA, MTL::Buffer *bBuffer,
+              std::size_t bOffset, MatMulFlag flagB,
+              MTL::Buffer *outputBuffer, std::size_t outputOffset,
+              std::size_t M, std::size_t K, std::size_t N,
+              bool tile);
   void qkvMatvecmulHeads(
       MTL::Buffer *inputBuffer, std::size_t inputOffset,
       MTL::Buffer *weightBuffer,
@@ -82,6 +88,28 @@ public:
                MTL::Buffer *biasBuffer, std::size_t biasOffset,
                MTL::Buffer *outputBuffer, std::size_t outputOffset,
                std::size_t elementCount, std::size_t outputWidth);
+  void eggrollOutputAdd(MTL::Buffer *outputBuffer,
+                        std::size_t outputOffset,
+                        MTL::Buffer *xbBuffer, std::size_t xbOffset,
+                        MTL::Buffer *aBuffer, std::size_t aOffset,
+                        std::size_t sequenceLength,
+                        std::size_t outputSize, std::size_t rank,
+                        float epsilon);
+  void eggrollFitness(MTL::Buffer *logitsBuffer,
+                      std::size_t logitsOffset,
+                      MTL::Buffer *targetsBuffer,
+                      std::size_t targetsOffset,
+                      MTL::Buffer *scratchBuffer,
+                      std::size_t lossesOffset,
+                      std::size_t fitnessOffset,
+                      std::size_t sequenceLength,
+                      std::size_t vocabularySize);
+  void eggrollWeightUpdate(
+      MTL::Buffer *weightBuffer, std::size_t weightOffset,
+      MTL::Buffer *perturbationBuffer, std::size_t aOffset,
+      std::size_t bOffset, std::size_t fitnessOffset,
+      std::size_t M, std::size_t N, std::size_t rank,
+      std::size_t populationSize, float scale);
   void cachedAttention(KVCache &cache, std::size_t layer,
                        MTL::Buffer *buffer, std::size_t queryOffset,
                        std::size_t outputOffset, std::size_t queryLength,
@@ -154,7 +182,7 @@ INFERENCE_PUBLIC void scaled_dot_product_attention_metal(
     std::size_t keyOffset, std::size_t valueOffset,
     std::size_t outputOffset, std::size_t sequenceLength,
     std::size_t headSize, std::size_t headCount, bool isCausal,
-    std::size_t scaleSize = 0);
+    std::size_t scaleSize = 0, std::size_t batchSize = 1);
 INFERENCE_PUBLIC float *scaled_dot_product_attention_cached_metal(
     MetalContext &context, KVCache &cache, std::size_t layer,
     const float *Q, std::size_t queryLength, std::size_t keyValueLength,

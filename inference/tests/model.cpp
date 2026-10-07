@@ -2,6 +2,7 @@
 
 #include <model.hpp>
 #include <tokenizer.hpp>
+#include <eggroll/perturbation.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -118,14 +119,129 @@ TEST_CASE("model embedding validates tokens and context length",
   CHECK_THROWS_AS(model.embed(longSequence, 3), std::invalid_argument);
 }
 
+TEST_CASE("model weights can span multiple GPU buffers", "[model][weights][sharding]") {
+  TemporaryModelFile source;
+  TemporaryModelFile saved;
+  writeEmbeddingModel(source.path);
+  inference::Model model(source.path, 24);
+
+  model.load();
+  CHECK(model.loaded());
+  CHECK(model.weightShardCount() == 2);
+  CHECK(model.weightOffset("token_embedding_table.weight") != model.weightOffset("position_embedding_table.weight"));
+  model.save(saved.path);
+
+  inference::ModelParameters savedParameters = inference::ModelParameters::loadGGUF(saved.path);
+  const float *savedTokens = savedParameters.data("token_embedding_table.weight");
+  const float *savedPositions = savedParameters.data("position_embedding_table.weight");
+  const float expectedTokens[]{1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F};
+  const float expectedPositions[]{10.0F, 20.0F, 30.0F, 40.0F};
+  for (std::size_t index = 0; index < 6; index++) {
+    CHECK(savedTokens[index] == expectedTokens[index]);
+  }
+  for (std::size_t index = 0; index < 4; index++) {
+    CHECK(savedPositions[index] == expectedPositions[index]);
+  }
+
+  model.release();
+  CHECK_FALSE(model.loaded());
+  CHECK(model.weightShardCount() == 0);
+}
+
+TEST_CASE("model rejects a tensor larger than its GPU shard limit", "[model][weights][sharding][validation]") {
+  TemporaryModelFile file;
+  writeEmbeddingModel(file.path);
+  inference::Model model(file.path, 23);
+  CHECK_THROWS_AS(model.load(), std::runtime_error);
+}
+
+TEST_CASE("model applies an EGGROLL perturbation by weight offset",
+          "[model][eggroll][.integration]") {
+  const std::filesystem::path modelPath =
+      std::filesystem::path(INFERENCE_SOURCE_ROOT) / "resources/model.gguf";
+  inference::ModelParameters parameters =
+      inference::ModelParameters::loadGGUF(modelPath);
+  const inference::GGUFTensor &weight = parameters.tensor("lm_head.weight");
+  inference::eggroll::EGGROLLPerturbation perturbation =
+      inference::eggroll::generatePerturbation(
+          static_cast<std::size_t>(weight.shape[1]),
+          static_cast<std::size_t>(weight.shape[0]), 1, 17);
+
+  inference::Model model(modelPath);
+  model.load();
+  inference::Tokenizer tokenizer;
+  std::vector<int> tokens = tokenizer.encode("ROMEO:\n");
+  std::size_t elementCount = tokens.size() * model.vocabularySize();
+  std::size_t offset = model.weightOffset("lm_head.weight");
+
+  float *normal = model.forward(
+      tokens.data(), static_cast<unsigned int>(tokens.size()));
+  float *zero = model.forwardPerturbed(
+      tokens.data(), tokens.size(), offset, perturbation, 0.0F);
+  float *positive = model.forwardPerturbed(
+      tokens.data(), tokens.size(), offset, perturbation, 0.01F);
+  float *negative = model.forwardPerturbed(
+      tokens.data(), tokens.size(), offset, perturbation, -0.01F);
+  float *normalAfter = model.forward(
+      tokens.data(), static_cast<unsigned int>(tokens.size()));
+
+  bool changed = false;
+  for (std::size_t index = 0; index < elementCount; index++) {
+    CAPTURE(index);
+    CHECK(std::fabs(zero[index] - normal[index]) < 0.00001F);
+    CHECK(std::fabs(positive[index] + negative[index] -
+                    2.0F * normal[index]) < 0.001F);
+    CHECK(std::fabs(normalAfter[index] - normal[index]) < 0.00001F);
+    if (std::fabs(positive[index] - normal[index]) > 0.00001F) {
+      changed = true;
+    }
+  }
+  CHECK(changed);
+
+  std::free(normal);
+  std::free(zero);
+  std::free(positive);
+  std::free(negative);
+  std::free(normalAfter);
+  model.release();
+}
+
+TEST_CASE("batched model execution matches independent sequences", "[model][batch][eggroll][.integration]") {
+  const std::filesystem::path modelPath = std::filesystem::path(INFERENCE_SOURCE_ROOT) / "resources/model.gguf";
+  inference::Model model(modelPath);
+  model.load();
+  inference::Tokenizer tokenizer;
+  std::vector<int> first = tokenizer.encode("ROMEO:\n");
+  std::vector<int> second = tokenizer.encode("JULIET:");
+  REQUIRE(first.size() == second.size());
+  std::vector<int> batch = first;
+  batch.insert(batch.end(), second.begin(), second.end());
+
+  float *firstLogits = model.forward(first.data(), static_cast<unsigned int>(first.size()));
+  float *secondLogits = model.forward(second.data(), static_cast<unsigned int>(second.size()));
+  float *batchLogits = model.forwardBatch(batch.data(), 2, first.size());
+  std::size_t sequenceElements = first.size() * model.vocabularySize();
+  for (std::size_t index = 0; index < sequenceElements; index++) {
+    CAPTURE(index);
+    CHECK(std::fabs(batchLogits[index] - firstLogits[index]) < 0.001F);
+    CHECK(std::fabs(batchLogits[sequenceElements + index] - secondLogits[index]) < 0.001F);
+  }
+
+  std::free(firstLogits);
+  std::free(secondLogits);
+  std::free(batchLogits);
+  model.release();
+}
+
 TEST_CASE("KV cache matches full-context model logits",
           "[model][kv-cache][.integration]") {
   const std::filesystem::path modelPath =
       std::filesystem::path(INFERENCE_SOURCE_ROOT) / "resources/model.gguf";
-  inference::Model model(modelPath);
+  inference::Model model(modelPath, 3 * 1024 * 1024);
   REQUIRE_FALSE(model.loaded());
   model.load();
   REQUIRE(model.loaded());
+  REQUIRE(model.weightShardCount() > 1);
   inference::Tokenizer tokenizer;
   std::vector<int> prompt = tokenizer.encode("ROMEO:\n");
 

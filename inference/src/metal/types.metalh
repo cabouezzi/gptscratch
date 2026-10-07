@@ -12,4 +12,5 @@ struct AttentionDims {
     uint headSize;
     uint cacheCapacity;
     uint queryStartPosition;
+    uint batchSize;
 };

@@ -36,6 +36,7 @@ struct AttentionDims {
   std::uint32_t headSize;
   std::uint32_t cacheCapacity;
   std::uint32_t queryStartPosition;
+  std::uint32_t batchSize;
 };
 
 struct HeadProjectionOffsets {
@@ -45,6 +46,21 @@ struct HeadProjectionOffsets {
   std::uint64_t queryOutput;
   std::uint64_t keyOutput;
   std::uint64_t valueOutput;
+};
+
+struct EGGROLLDims {
+  std::uint32_t T;
+  std::uint32_t N;
+  std::uint32_t r;
+  float epsilon;
+};
+
+struct EGGROLLUpdateDims {
+  std::uint32_t M;
+  std::uint32_t N;
+  std::uint32_t r;
+  std::uint32_t populationSize;
+  float scale;
 };
 
 std::filesystem::path executable_directory() {
@@ -224,6 +240,48 @@ void MetalCommandBatch::matvecmul(
   this->encoder->setBytes(&metalOutputSize, sizeof(metalOutputSize), 4);
   this->encoder->dispatchThreadgroups(
       MTL::Size((outputSize + 3) / 4, 1, 1), MTL::Size(32, 1, 1));
+  this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
+void MetalCommandBatch::matmul(
+    MTL::Buffer *aBuffer, std::size_t aOffset, MatMulFlag flagA,
+    MTL::Buffer *bBuffer, std::size_t bOffset, MatMulFlag flagB,
+    MTL::Buffer *outputBuffer, std::size_t outputOffset,
+    std::size_t M, std::size_t K, std::size_t N, bool tile) {
+  if (M == 0 || K == 0 || N == 0 ||
+      M > std::numeric_limits<std::uint32_t>::max() ||
+      K > std::numeric_limits<std::uint32_t>::max() ||
+      N > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Metal matmul dimensions are invalid");
+  }
+  if (M > std::numeric_limits<std::size_t>::max() / K / sizeof(float) ||
+      K > std::numeric_limits<std::size_t>::max() / N / sizeof(float) ||
+      M > std::numeric_limits<std::size_t>::max() / N / sizeof(float)) {
+    throw std::overflow_error("Metal matmul dimensions overflow");
+  }
+
+  validate_metal_buffer_range(aBuffer, aOffset, M * K * sizeof(float));
+  validate_metal_buffer_range(bBuffer, bOffset, K * N * sizeof(float));
+  validate_metal_buffer_range(outputBuffer, outputOffset,
+                              M * N * sizeof(float));
+
+  auto &metal = MetalContextAccess::get(*this->context);
+  MatrixDims dims = {
+      .M = static_cast<std::uint32_t>(M),
+      .K = static_cast<std::uint32_t>(K),
+      .N = static_cast<std::uint32_t>(N),
+  };
+  this->encoder->setComputePipelineState(
+      metal.pipeline(tile ? "matmul_tile" : "matmul_naive"));
+  this->encoder->setBuffer(aBuffer, aOffset, 0);
+  this->encoder->setBytes(&flagA, sizeof(flagA), 1);
+  this->encoder->setBuffer(bBuffer, bOffset, 2);
+  this->encoder->setBytes(&flagB, sizeof(flagB), 3);
+  this->encoder->setBuffer(outputBuffer, outputOffset, 4);
+  this->encoder->setBytes(&dims, sizeof(dims), 5);
+  this->encoder->dispatchThreadgroups(
+      MTL::Size((N + 31) / 32, (M + 31) / 32, 1),
+      tile ? MTL::Size(8, 16, 1) : MTL::Size(32, 32, 1));
   this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
@@ -439,6 +497,155 @@ void MetalCommandBatch::addBias(
   this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
+void MetalCommandBatch::eggrollOutputAdd(
+    MTL::Buffer *outputBuffer, std::size_t outputOffset,
+    MTL::Buffer *xbBuffer, std::size_t xbOffset,
+    MTL::Buffer *aBuffer, std::size_t aOffset,
+    std::size_t sequenceLength, std::size_t outputSize,
+    std::size_t rank, float epsilon) {
+  if (sequenceLength == 0 || outputSize == 0 || rank == 0 ||
+      sequenceLength > std::numeric_limits<std::uint32_t>::max() ||
+      outputSize > std::numeric_limits<std::uint32_t>::max() ||
+      rank > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Metal EGGROLL dimensions are invalid");
+  }
+  if (outputSize >
+          std::numeric_limits<std::size_t>::max() / sequenceLength ||
+      rank > std::numeric_limits<std::size_t>::max() / sequenceLength ||
+      rank > std::numeric_limits<std::size_t>::max() / outputSize) {
+    throw std::overflow_error("Metal EGGROLL dimensions overflow");
+  }
+
+  validate_metal_buffer_range(
+      outputBuffer, outputOffset,
+      sequenceLength * outputSize * sizeof(float));
+  validate_metal_buffer_range(
+      xbBuffer, xbOffset, sequenceLength * rank * sizeof(float));
+  validate_metal_buffer_range(
+      aBuffer, aOffset, outputSize * rank * sizeof(float));
+
+  auto &metal = MetalContextAccess::get(*this->context);
+  EGGROLLDims dims = {
+      .T = static_cast<std::uint32_t>(sequenceLength),
+      .N = static_cast<std::uint32_t>(outputSize),
+      .r = static_cast<std::uint32_t>(rank),
+      .epsilon = epsilon,
+  };
+
+  this->encoder->setComputePipelineState(
+      metal.pipeline("eggroll_output_add"));
+  this->encoder->setBuffer(outputBuffer, outputOffset, 0);
+  this->encoder->setBuffer(xbBuffer, xbOffset, 1);
+  this->encoder->setBuffer(aBuffer, aOffset, 2);
+  this->encoder->setBytes(&dims, sizeof(dims), 3);
+  this->encoder->dispatchThreads(
+      MTL::Size(outputSize, sequenceLength, 1), MTL::Size(16, 16, 1));
+  this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
+void MetalCommandBatch::eggrollFitness(
+    MTL::Buffer *logitsBuffer, std::size_t logitsOffset,
+    MTL::Buffer *targetsBuffer, std::size_t targetsOffset,
+    MTL::Buffer *scratchBuffer, std::size_t lossesOffset,
+    std::size_t fitnessOffset, std::size_t sequenceLength,
+    std::size_t vocabularySize) {
+  if (sequenceLength == 0 || vocabularySize == 0 ||
+      sequenceLength > std::numeric_limits<std::uint32_t>::max() ||
+      vocabularySize > std::numeric_limits<std::uint32_t>::max() ||
+      sequenceLength > std::numeric_limits<std::size_t>::max() /
+                           vocabularySize / sizeof(float)) {
+    throw std::invalid_argument("Metal EGGROLL fitness dimensions are invalid");
+  }
+
+  validate_metal_buffer_range(
+      logitsBuffer, logitsOffset,
+      sequenceLength * vocabularySize * sizeof(float));
+  validate_metal_buffer_range(targetsBuffer, targetsOffset,
+                              sequenceLength * sizeof(float));
+  validate_metal_buffer_range(scratchBuffer, lossesOffset,
+                              sequenceLength * sizeof(float));
+  validate_metal_buffer_range(scratchBuffer, fitnessOffset, sizeof(float));
+
+  auto &metal = MetalContextAccess::get(*this->context);
+  std::uint32_t metalSequenceLength =
+      static_cast<std::uint32_t>(sequenceLength);
+  std::uint32_t metalVocabularySize =
+      static_cast<std::uint32_t>(vocabularySize);
+
+  this->encoder->setComputePipelineState(
+      metal.pipeline("eggroll_cross_entropy"));
+  this->encoder->setBuffer(logitsBuffer, logitsOffset, 0);
+  this->encoder->setBuffer(targetsBuffer, targetsOffset, 1);
+  this->encoder->setBuffer(scratchBuffer, lossesOffset, 2);
+  this->encoder->setBytes(&metalVocabularySize,
+                          sizeof(metalVocabularySize), 3);
+  this->encoder->dispatchThreadgroups(MTL::Size(sequenceLength, 1, 1),
+                                      MTL::Size(32, 1, 1));
+  this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+
+  this->encoder->setComputePipelineState(
+      metal.pipeline("eggroll_fitness_reduce"));
+  this->encoder->setBuffer(scratchBuffer, lossesOffset, 0);
+  this->encoder->setBuffer(scratchBuffer, fitnessOffset, 1);
+  this->encoder->setBytes(&metalSequenceLength,
+                          sizeof(metalSequenceLength), 2);
+  this->encoder->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                      MTL::Size(32, 1, 1));
+  this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
+void MetalCommandBatch::eggrollWeightUpdate(
+    MTL::Buffer *weightBuffer, std::size_t weightOffset,
+    MTL::Buffer *perturbationBuffer, std::size_t aOffset,
+    std::size_t bOffset, std::size_t fitnessOffset,
+    std::size_t M, std::size_t N, std::size_t rank,
+    std::size_t populationSize, float scale) {
+  if (M == 0 || N == 0 || rank == 0 || populationSize == 0 ||
+      M > std::numeric_limits<std::uint32_t>::max() ||
+      N > std::numeric_limits<std::uint32_t>::max() ||
+      rank > std::numeric_limits<std::uint32_t>::max() ||
+      populationSize > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Metal EGGROLL update dimensions are invalid");
+  }
+  if (N > std::numeric_limits<std::size_t>::max() / M / sizeof(float) ||
+      populationSize > std::numeric_limits<std::size_t>::max() / N / rank /
+                           sizeof(float) ||
+      populationSize > std::numeric_limits<std::size_t>::max() / M / rank /
+                           sizeof(float)) {
+    throw std::overflow_error("Metal EGGROLL update dimensions overflow");
+  }
+
+  validate_metal_buffer_range(weightBuffer, weightOffset,
+                              M * N * sizeof(float));
+  validate_metal_buffer_range(
+      perturbationBuffer, aOffset,
+      populationSize * N * rank * sizeof(float));
+  validate_metal_buffer_range(
+      perturbationBuffer, bOffset,
+      populationSize * M * rank * sizeof(float));
+  validate_metal_buffer_range(perturbationBuffer, fitnessOffset,
+                              populationSize * sizeof(float));
+
+  auto &metal = MetalContextAccess::get(*this->context);
+  EGGROLLUpdateDims dims = {
+      .M = static_cast<std::uint32_t>(M),
+      .N = static_cast<std::uint32_t>(N),
+      .r = static_cast<std::uint32_t>(rank),
+      .populationSize = static_cast<std::uint32_t>(populationSize),
+      .scale = scale,
+  };
+  this->encoder->setComputePipelineState(
+      metal.pipeline("eggroll_weight_update"));
+  this->encoder->setBuffer(weightBuffer, weightOffset, 0);
+  this->encoder->setBuffer(perturbationBuffer, aOffset, 1);
+  this->encoder->setBuffer(perturbationBuffer, bOffset, 2);
+  this->encoder->setBuffer(perturbationBuffer, fitnessOffset, 3);
+  this->encoder->setBytes(&dims, sizeof(dims), 4);
+  this->encoder->dispatchThreads(MTL::Size(M, N, 1),
+                                 MTL::Size(16, 16, 1));
+  this->encoder->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
 void MetalCommandBatch::cachedAttention(
     KVCache &cache, std::size_t layer, MTL::Buffer *buffer,
     std::size_t queryOffset, std::size_t outputOffset,
@@ -470,6 +677,7 @@ void MetalCommandBatch::cachedAttention(
       .headSize = static_cast<std::uint32_t>(cache.headSize),
       .cacheCapacity = static_cast<std::uint32_t>(cache.cacheCapacity),
       .queryStartPosition = static_cast<std::uint32_t>(queryStartPosition),
+      .batchSize = 1,
   };
   std::uint32_t metalHeadCount = static_cast<std::uint32_t>(cache.headCount);
   std::uint32_t metalScaleSize = static_cast<std::uint32_t>(scaleSize);
@@ -1447,6 +1655,7 @@ float *scaled_dot_product_attention_metal(
       .headSize = static_cast<std::uint32_t>(head_size),
       .cacheCapacity = static_cast<std::uint32_t>(seq_len),
       .queryStartPosition = 0,
+      .batchSize = 1,
   };
   std::uint32_t metal_num_heads = static_cast<std::uint32_t>(num_heads);
   std::uint32_t metal_scale_size = static_cast<std::uint32_t>(scale_size);
@@ -1487,8 +1696,9 @@ void scaled_dot_product_attention_metal(
     std::size_t queryOffset, std::size_t keyOffset,
     std::size_t valueOffset, std::size_t outputOffset,
     std::size_t sequenceLength, std::size_t headSize,
-    std::size_t headCount, bool isCausal, std::size_t scaleSize) {
-  if (sequenceLength == 0 || headSize == 0 || headCount == 0) {
+    std::size_t headCount, bool isCausal, std::size_t scaleSize,
+    std::size_t batchSize) {
+  if (sequenceLength == 0 || headSize == 0 || headCount == 0 || batchSize == 0) {
     throw std::invalid_argument("Metal attention dimensions must be positive");
   }
   if (scaleSize == 0) {
@@ -1497,11 +1707,12 @@ void scaled_dot_product_attention_metal(
   if (sequenceLength > std::numeric_limits<std::uint32_t>::max() ||
       headSize > std::numeric_limits<std::uint32_t>::max() ||
       headCount > std::numeric_limits<std::uint32_t>::max() ||
+      batchSize > std::numeric_limits<std::uint32_t>::max() ||
       scaleSize > std::numeric_limits<std::uint32_t>::max()) {
     throw std::invalid_argument("Metal attention dimensions exceed uint32_t");
   }
 
-  std::size_t elementCount = sequenceLength * headSize * headCount;
+  std::size_t elementCount = sequenceLength * batchSize * headSize * headCount;
   std::size_t byteCount = elementCount * sizeof(float);
   validate_metal_buffer_range(buffer, queryOffset, byteCount);
   validate_metal_buffer_range(buffer, keyOffset, byteCount);
@@ -1518,6 +1729,7 @@ void scaled_dot_product_attention_metal(
       .headSize = static_cast<std::uint32_t>(headSize),
       .cacheCapacity = static_cast<std::uint32_t>(sequenceLength),
       .queryStartPosition = 0,
+      .batchSize = static_cast<std::uint32_t>(batchSize),
   };
   std::uint32_t metalHeadCount =
       static_cast<std::uint32_t>(headCount);
@@ -1536,7 +1748,7 @@ void scaled_dot_product_attention_metal(
   encoder->setBytes(&metalHeadCount, sizeof(metalHeadCount), 6);
   encoder->setBytes(&metalScaleSize, sizeof(metalScaleSize), 7);
   encoder->dispatchThreadgroups(
-      MTL::Size(sequenceLength, headCount, 1), MTL::Size(32, 1, 1));
+      MTL::Size(sequenceLength, headCount, batchSize), MTL::Size(32, 1, 1));
   encoder->endEncoding();
   commandBuffer->commit();
   commandBuffer->waitUntilCompleted();
@@ -1596,6 +1808,7 @@ float *scaled_dot_product_attention_cached_metal(
       .cacheCapacity = static_cast<std::uint32_t>(cache.cacheCapacity),
       .queryStartPosition =
           static_cast<std::uint32_t>(queryStartPosition),
+      .batchSize = 1,
   };
   std::uint32_t metalHeadCount =
       static_cast<std::uint32_t>(cache.headCount);
@@ -1672,6 +1885,7 @@ void scaled_dot_product_attention_cached_metal(
       .cacheCapacity = static_cast<std::uint32_t>(cache.cacheCapacity),
       .queryStartPosition =
           static_cast<std::uint32_t>(queryStartPosition),
+      .batchSize = 1,
   };
   std::uint32_t metalHeadCount =
       static_cast<std::uint32_t>(cache.headCount);

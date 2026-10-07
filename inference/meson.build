@@ -43,6 +43,9 @@ attention_source = files('src/cpu/attention.cpp')
 metal_backend_source = files('src/metal/backend.cpp')
 kv_cache_source = files('src/metal/kv_cache.cpp')
 sources = files(
+  'src/eggroll/backend.cpp',
+  'src/eggroll/perturbation.cpp',
+  'src/eggroll/trainer.cpp',
   'src/model.cpp',
   'src/model_loader.cpp',
   'src/tokenizer.cpp',
@@ -76,6 +79,15 @@ generate_exe = executable(
   link_depends : inference_metallib,
 )
 
+train_eggroll_exe = executable(
+  'train_eggroll',
+  'train_eggroll.cpp',
+  include_directories : project_includes,
+  dependencies : dependencies,
+  link_with : lib,
+  link_depends : inference_metallib,
+)
+
 test_exe = executable(
   'inference_test',
   [
@@ -83,9 +95,12 @@ test_exe = executable(
     'tests/model.cpp',
     'tests/model_loader.cpp',
     'tests/tokenizer.cpp',
+    'tests/eggroll/perturbation.cpp',
+    'tests/eggroll/trainer.cpp',
     'tests/cpu/matmul.cpp',
     'tests/metal/bias.cpp',
     'tests/metal/cache.cpp',
+    'tests/metal/eggroll.cpp',
     'tests/metal/matmul.cpp',
     'tests/metal/relu.cpp',
     'tests/metal/residual.cpp',
@@ -116,6 +131,9 @@ meson.override_dependency('inference', inference_dep)
 # package manager.
 install_headers(
   'include/export.hpp',
+  'include/eggroll/backend.hpp',
+  'include/eggroll/perturbation.hpp',
+  'include/eggroll/trainer.hpp',
   'include/inference.hpp',
   'include/metal/backend.hpp',
   'include/metal/kv_cache.hpp',

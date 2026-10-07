@@ -1,13 +1,59 @@
 #include <model_loader.hpp>
 
 #include <bit>
+#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <system_error>
 #include <type_traits>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace inference {
+
+struct ModelParameters::MappedFileData {
+  explicit MappedFileData(const std::filesystem::path &path) {
+    int descriptor = open(path.c_str(), O_RDONLY);
+    if (descriptor == -1) {
+      throw std::system_error(errno, std::generic_category(), "Could not open GGUF model: " + path.string());
+    }
+
+    struct stat information {};
+    if (fstat(descriptor, &information) == -1) {
+      int error = errno;
+      close(descriptor);
+      throw std::system_error(error, std::generic_category(), "Could not determine GGUF model size");
+    }
+    if (information.st_size <= 0) {
+      close(descriptor);
+      throw std::runtime_error("GGUF model is empty: " + path.string());
+    }
+
+    this->size = static_cast<std::size_t>(information.st_size);
+    void *mapping = mmap(nullptr, this->size, PROT_READ, MAP_PRIVATE, descriptor, 0);
+    int error = errno;
+    close(descriptor);
+    if (mapping == MAP_FAILED) {
+      throw std::system_error(error, std::generic_category(), "Could not map GGUF model: " + path.string());
+    }
+    this->bytes = static_cast<const std::uint8_t *>(mapping);
+  }
+
+  ~MappedFileData() {
+    if (this->bytes != nullptr) {
+      munmap(const_cast<std::uint8_t *>(this->bytes), this->size);
+    }
+  }
+
+  const std::uint8_t *bytes = nullptr;
+  std::size_t size = 0;
+};
+
 namespace {
 
 constexpr std::uint32_t GGUF_VERSION = 3;
@@ -33,14 +79,17 @@ enum class MetadataType : std::uint32_t {
 class Reader {
 
 public:
-  explicit Reader(const std::vector<std::uint8_t> &bytes) : bytes(bytes) {}
+  Reader(const std::uint8_t *bytes, std::size_t size) {
+    this->bytes = bytes;
+    this->size = size;
+  }
 
   template <typename T> T read() {
     static_assert(std::is_trivially_copyable_v<T>);
     require(sizeof(T));
 
     T value;
-    std::memcpy(&value, bytes.data() + position, sizeof(T));
+    std::memcpy(&value, this->bytes + position, sizeof(T));
     position += sizeof(T);
 
     if constexpr (sizeof(T) > 1) {
@@ -59,7 +108,7 @@ public:
     require(static_cast<std::size_t>(length));
 
     const char *start =
-        reinterpret_cast<const char *>(bytes.data() + position);
+        reinterpret_cast<const char *>(this->bytes + position);
     std::string value(start, static_cast<std::size_t>(length));
     position += static_cast<std::size_t>(length);
     return value;
@@ -69,12 +118,13 @@ public:
 
 private:
   void require(std::size_t count) const {
-    if (count > bytes.size() - position) {
+    if (this->position > this->size || count > this->size - this->position) {
       throw std::runtime_error("Unexpected end of GGUF file");
     }
   }
 
-  const std::vector<std::uint8_t> &bytes;
+  const std::uint8_t *bytes;
+  std::size_t size;
   std::size_t position = 0;
 };
 
@@ -156,32 +206,12 @@ GGUFMetadataValue readMetadataValue(Reader &reader, MetadataType type,
   throw std::runtime_error("Unsupported GGUF metadata type");
 } // namespace inference
 
-std::vector<std::uint8_t> readFile(const std::filesystem::path &path) {
-  std::ifstream input(path, std::ios::binary | std::ios::ate);
-  if (!input) {
-    throw std::runtime_error("Could not open GGUF model: " + path.string());
-  }
-
-  std::streamsize size = input.tellg();
-  if (size < 0) {
-    throw std::runtime_error("Could not determine GGUF model size");
-  }
-
-  std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
-  input.seekg(0);
-  if (!bytes.empty() &&
-      !input.read(reinterpret_cast<char *>(bytes.data()), size)) {
-    throw std::runtime_error("Could not read GGUF model: " + path.string());
-  }
-  return bytes;
-}
-
 }
 
 ModelParameters ModelParameters::loadGGUF(const std::filesystem::path &path) {
   ModelParameters parameters;
-  parameters.fileData = readFile(path);
-  Reader reader(parameters.fileData);
+  parameters.fileData = std::make_shared<MappedFileData>(path);
+  Reader reader(parameters.fileData->bytes, parameters.fileData->size);
 
   const char expectedMagic[]{'G', 'G', 'U', 'F'};
   for (char expected : expectedMagic) {
@@ -287,8 +317,8 @@ ModelParameters ModelParameters::loadGGUF(const std::filesystem::path &path) {
     }
     std::size_t byteCount =
         static_cast<std::size_t>(pending.elementCount) * sizeof(float);
-    if (dataOffset > parameters.fileData.size() ||
-        byteCount > parameters.fileData.size() - dataOffset) {
+    if (dataOffset > parameters.fileData->size ||
+        byteCount > parameters.fileData->size - dataOffset) {
       throw std::runtime_error("GGUF tensor data is outside the file");
     }
 
@@ -321,8 +351,7 @@ const GGUFTensor &ModelParameters::tensor(const std::string &name) const {
 
 const float *ModelParameters::data(const std::string &name) const {
   const GGUFTensor &tensorInfo = tensor(name);
-  return reinterpret_cast<const float *>(fileData.data() +
-                                         tensorInfo.dataOffset);
+  return reinterpret_cast<const float *>(this->fileData->bytes + tensorInfo.dataOffset);
 }
 
 const GGUFMetadataValue &
@@ -337,6 +366,56 @@ ModelParameters::metadata(const std::string &key) const {
 const std::unordered_map<std::string, GGUFTensor> &
 ModelParameters::allTensors() const {
   return this->tensors;
+}
+
+void ModelParameters::saveGGUF(const std::filesystem::path &path, const std::unordered_map<std::string, std::vector<float>> &tensorData) const {
+  std::ofstream output(path, std::ios::binary);
+  if (!output) {
+    throw std::runtime_error("Could not create GGUF model: " + path.string());
+  }
+  output.write(reinterpret_cast<const char *>(this->fileData->bytes), static_cast<std::streamsize>(this->fileData->size));
+  if (!output) {
+    throw std::runtime_error("Could not write GGUF model: " + path.string());
+  }
+  output.close();
+
+  std::fstream replacement(path, std::ios::binary | std::ios::in | std::ios::out);
+  for (const auto &[name, values] : tensorData) {
+    const GGUFTensor &tensorInfo = this->tensor(name);
+    if (values.size() != tensorInfo.elementCount) {
+      throw std::invalid_argument("GGUF replacement tensor has the wrong size: " + name);
+    }
+    replacement.seekp(static_cast<std::streamoff>(tensorInfo.dataOffset));
+    replacement.write(reinterpret_cast<const char *>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+  }
+  if (!replacement) {
+    throw std::runtime_error("Could not update GGUF model: " + path.string());
+  }
+}
+
+void ModelParameters::saveGGUF(const std::filesystem::path &path, const std::function<std::vector<float>(const std::string &, const GGUFTensor &)> &tensorReader) const {
+  std::ofstream output(path, std::ios::binary);
+  if (!output) {
+    throw std::runtime_error("Could not create GGUF model: " + path.string());
+  }
+  output.write(reinterpret_cast<const char *>(this->fileData->bytes), static_cast<std::streamsize>(this->fileData->size));
+  if (!output) {
+    throw std::runtime_error("Could not write GGUF model: " + path.string());
+  }
+  output.close();
+
+  std::fstream replacement(path, std::ios::binary | std::ios::in | std::ios::out);
+  for (const auto &[name, tensorInfo] : this->tensors) {
+    std::vector<float> values = tensorReader(name, tensorInfo);
+    if (values.size() != tensorInfo.elementCount) {
+      throw std::invalid_argument("GGUF replacement tensor has the wrong size: " + name);
+    }
+    replacement.seekp(static_cast<std::streamoff>(tensorInfo.dataOffset));
+    replacement.write(reinterpret_cast<const char *>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(float)));
+  }
+  if (!replacement) {
+    throw std::runtime_error("Could not update GGUF model: " + path.string());
+  }
 }
 
 }

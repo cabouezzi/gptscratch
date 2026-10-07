@@ -17,9 +17,10 @@ int main(int argc, char **argv) {
       tokenCount = static_cast<std::size_t>(std::stoul(argv[2]));
     }
     bool useCache = argc <= 3 || std::string(argv[3]) != "--no-cache";
+    std::string modelPath = argc > 4 ? argv[4] : "resources/model.gguf";
 
     inference::Tokenizer tokenizer;
-    inference::Model model("resources/model.gguf");
+    inference::Model model(modelPath);
     model.load();
     std::vector<int> tokens = tokenizer.encode(prompt);
     if (tokens.empty()) {

@@ -1,5 +1,6 @@
 #include <model.hpp>
 
+#include <eggroll/backend.hpp>
 #include <metal/backend.hpp>
 
 #include <algorithm>
@@ -32,6 +33,19 @@ std::size_t alignBytes(std::size_t value, std::size_t alignment) {
 }
 
 Model::Model(const std::filesystem::path &path) {
+  this->initialize(path, 512ULL * 1024ULL * 1024ULL);
+}
+
+Model::Model(const std::filesystem::path &path,
+             std::size_t weightShardByteLimit) {
+  this->initialize(path, weightShardByteLimit);
+}
+
+void Model::initialize(const std::filesystem::path &path,
+                       std::size_t weightShardByteLimit) {
+  if (weightShardByteLimit == 0) {
+    throw std::invalid_argument("Model weight shard size must be positive");
+  }
   this->parameters = ModelParameters::loadGGUF(path);
 
   const GGUFTensor &tokenEmbedding =
@@ -42,12 +56,14 @@ Model::Model(const std::filesystem::path &path) {
   this->input_size = static_cast<std::size_t>(tokenEmbedding.shape[1]);
   this->output_size = static_cast<std::size_t>(tokenEmbedding.shape[0]);
   this->context_size = static_cast<std::size_t>(positionEmbedding.shape[0]);
+  this->weight_shard_byte_limit = weightShardByteLimit;
+  this->active_epsilon = 0.0F;
 }
 
 Model::~Model() { this->release(); }
 
 void Model::load() {
-  if (this->model_buffer != nullptr) {
+  if (this->loaded()) {
     return;
   }
 
@@ -60,51 +76,109 @@ void Model::load() {
   std::sort(names.begin(), names.end());
 
   std::unordered_map<std::string, std::size_t> offsets;
-  std::size_t byteCount = 0;
+  std::unordered_map<std::size_t, WeightLocation> locations;
+  std::vector<std::size_t> shardByteCounts;
+  std::size_t globalOffset = 0;
+  std::size_t shardOffset = 0;
+  std::size_t shardIndex = 0;
   for (const std::string &name : names) {
-    byteCount = alignBytes(byteCount, weightAlignment);
-    offsets.emplace(name, byteCount);
     const GGUFTensor &tensor = this->parameters.tensor(name);
-    byteCount +=
-        static_cast<std::size_t>(tensor.elementCount) * sizeof(float);
+    std::size_t tensorByteCount = static_cast<std::size_t>(tensor.elementCount) * sizeof(float);
+    if (tensorByteCount > this->weight_shard_byte_limit) {
+      throw std::runtime_error("Model tensor exceeds the configured GPU weight shard size: " + name);
+    }
+    globalOffset = alignBytes(globalOffset, weightAlignment);
+    shardOffset = alignBytes(shardOffset, weightAlignment);
+    if (shardOffset != 0 && (shardOffset > this->weight_shard_byte_limit || tensorByteCount > this->weight_shard_byte_limit - shardOffset)) {
+      shardByteCounts.push_back(shardOffset);
+      shardIndex++;
+      shardOffset = 0;
+    }
+    offsets.emplace(name, globalOffset);
+    locations.emplace(globalOffset, WeightLocation{.shardIndex = shardIndex, .localOffset = shardOffset, .byteCount = tensorByteCount});
+    globalOffset += tensorByteCount;
+    shardOffset += tensorByteCount;
+  }
+  if (!names.empty()) {
+    shardByteCounts.push_back(shardOffset);
   }
 
-  MTL::Buffer *staging =
-      allocate_metal_buffer(this->metal_context, byteCount);
-  MTL::Buffer *gpuWeights = nullptr;
+  std::vector<MTL::Buffer *> gpuWeights;
+  gpuWeights.reserve(shardByteCounts.size());
   try {
-    for (const std::string &name : names) {
-      const GGUFTensor &tensor = this->parameters.tensor(name);
-      write_metal_buffer(
-          staging, offsets.at(name), this->parameters.data(name),
-          static_cast<std::size_t>(tensor.elementCount));
+    for (std::size_t currentShard = 0; currentShard < shardByteCounts.size(); currentShard++) {
+      MTL::Buffer *staging = allocate_metal_buffer(this->metal_context, shardByteCounts[currentShard]);
+      MTL::Buffer *gpuShard = nullptr;
+      try {
+        for (const std::string &name : names) {
+          const WeightLocation &location = locations.at(offsets.at(name));
+          if (location.shardIndex != currentShard) {
+            continue;
+          }
+          const GGUFTensor &tensor = this->parameters.tensor(name);
+          write_metal_buffer(staging, location.localOffset, this->parameters.data(name), static_cast<std::size_t>(tensor.elementCount));
+        }
+        gpuShard = allocate_private_metal_buffer(this->metal_context, shardByteCounts[currentShard]);
+        copy_metal_buffer(this->metal_context, staging, 0, gpuShard, 0, shardByteCounts[currentShard]);
+        release_metal_buffer(staging);
+        gpuWeights.push_back(gpuShard);
+      } catch (...) {
+        release_metal_buffer(staging);
+        release_metal_buffer(gpuShard);
+        throw;
+      }
     }
-
-    gpuWeights =
-        allocate_private_metal_buffer(this->metal_context, byteCount);
-    copy_metal_buffer(this->metal_context, staging, 0, gpuWeights, 0,
-                      byteCount);
-    release_metal_buffer(staging);
-    this->model_buffer = gpuWeights;
+    this->model_buffers = std::move(gpuWeights);
+    this->model_buffer_byte_counts = std::move(shardByteCounts);
     this->weight_offsets = std::move(offsets);
+    this->weight_locations = std::move(locations);
   } catch (...) {
-    release_metal_buffer(staging);
-    release_metal_buffer(gpuWeights);
+    for (MTL::Buffer *buffer : gpuWeights) {
+      release_metal_buffer(buffer);
+    }
     throw;
   }
 }
 
 void Model::release() {
   this->kv_cache.reset();
-  release_metal_buffer(this->model_buffer);
-  this->model_buffer = nullptr;
+  for (MTL::Buffer *buffer : this->model_buffers) {
+    release_metal_buffer(buffer);
+  }
+  this->model_buffers.clear();
+  this->model_buffer_byte_counts.clear();
   this->weight_offsets.clear();
+  this->weight_locations.clear();
 }
 
-bool Model::loaded() const { return this->model_buffer != nullptr; }
+void Model::save(const std::filesystem::path &path) {
+  if (!this->loaded()) {
+    throw std::runtime_error("Load model weights before saving");
+  }
+  this->parameters.saveGGUF(path, [this](const std::string &name, const GGUFTensor &tensor) {
+    WeightBinding weight = this->resolveWeight(this->weightOffset(name));
+    std::size_t byteCount = static_cast<std::size_t>(tensor.elementCount) * sizeof(float);
+    MTL::Buffer *staging = allocate_metal_buffer(this->metal_context, byteCount);
+    float *values = nullptr;
+    try {
+      copy_metal_buffer(this->metal_context, weight.buffer, weight.offset, staging, 0, byteCount);
+      values = read_metal_buffer(staging, 0, static_cast<std::size_t>(tensor.elementCount));
+      std::vector<float> result(values, values + tensor.elementCount);
+      std::free(values);
+      release_metal_buffer(staging);
+      return result;
+    } catch (...) {
+      std::free(values);
+      release_metal_buffer(staging);
+      throw;
+    }
+  });
+}
+
+bool Model::loaded() const { return !this->model_buffers.empty(); }
 
 std::size_t Model::weightOffset(const std::string &name) const {
-  if (this->model_buffer == nullptr) {
+  if (!this->loaded()) {
     throw std::runtime_error("Model weights are not loaded into GPU memory");
   }
   auto offset = this->weight_offsets.find(name);
@@ -112,6 +186,16 @@ std::size_t Model::weightOffset(const std::string &name) const {
     throw std::out_of_range("GPU model tensor not found: " + name);
   }
   return offset->second;
+}
+
+std::size_t Model::weightShardCount() const { return this->model_buffers.size(); }
+
+Model::WeightBinding Model::resolveWeight(std::size_t globalOffset) const {
+  auto location = this->weight_locations.find(globalOffset);
+  if (location == this->weight_locations.end() || location->second.shardIndex >= this->model_buffers.size()) {
+    throw std::out_of_range("GPU model weight offset was not found");
+  }
+  return WeightBinding{.buffer = this->model_buffers[location->second.shardIndex], .offset = location->second.localOffset};
 }
 
 float *Model::embed(const int *tokens, std::size_t sequenceLength) const {
@@ -154,6 +238,33 @@ float *Model::embedAt(const int *tokens, std::size_t sequenceLength,
   return embeddings;
 }
 
+float *Model::embedBatch(const int *tokens, std::size_t batchSize, std::size_t sequenceLength) const {
+  if (batchSize == 0 || sequenceLength == 0 || sequenceLength > this->context_size) {
+    throw std::invalid_argument("Model batch dimensions are invalid");
+  }
+  const float *tokenEmbeddingWeights = this->parameters.data("token_embedding_table.weight");
+  const float *positionEmbeddingWeights = this->parameters.data("position_embedding_table.weight");
+  std::size_t rowCount = batchSize * sequenceLength;
+  float *embeddings = allocateFloats(rowCount * this->input_size);
+  for (std::size_t batch = 0; batch < batchSize; batch++) {
+    for (std::size_t position = 0; position < sequenceLength; position++) {
+      std::size_t row = batch * sequenceLength + position;
+      int token = tokens[row];
+      if (token < 0 || static_cast<std::size_t>(token) >= this->output_size) {
+        std::free(embeddings);
+        throw std::out_of_range("Token ID exceeds the model vocabulary");
+      }
+      for (std::size_t channel = 0; channel < this->input_size; channel++) {
+        std::size_t embeddingIndex = row * this->input_size + channel;
+        std::size_t tokenEmbeddingIndex = static_cast<std::size_t>(token) * this->input_size + channel;
+        std::size_t positionEmbeddingIndex = position * this->input_size + channel;
+        embeddings[embeddingIndex] = tokenEmbeddingWeights[tokenEmbeddingIndex] + positionEmbeddingWeights[positionEmbeddingIndex];
+      }
+    }
+  }
+  return embeddings;
+}
+
 Model::Workspace Model::allocateWorkspace(std::size_t sequenceLength) {
   std::size_t feedForwardSize = this->input_size * 4;
   std::size_t scratchWidth =
@@ -180,7 +291,7 @@ Model::Workspace Model::allocateWorkspace(std::size_t sequenceLength) {
 }
 
 void Model::linear(Workspace &workspace, std::size_t inputOffset,
-                   const std::string &weightName,
+                   std::size_t weightOffset,
                    std::size_t outputOffset,
                    std::size_t sequenceLength, std::size_t inputSize,
                    std::size_t outputSize, MetalCommandBatch *batch,
@@ -188,27 +299,45 @@ void Model::linear(Workspace &workspace, std::size_t inputOffset,
   if (outputBuffer == nullptr) {
     outputBuffer = workspace.buffer;
   }
+  auto [matrix, inserted] = this->linear_matrices.emplace(
+      weightOffset, eggroll::EGGROLLMatrix{
+                        .weightOffset = weightOffset,
+                        .M = inputSize,
+                        .N = outputSize,
+                    });
+  if (!inserted &&
+      (matrix->second.M != inputSize || matrix->second.N != outputSize)) {
+    throw std::logic_error(
+        "A model weight offset was used with inconsistent dimensions");
+  }
+  WeightBinding weight = this->resolveWeight(weightOffset);
   if (sequenceLength == 1) {
     if (batch != nullptr) {
-      batch->matvecmul(
-          workspace.buffer, inputOffset, this->model_buffer,
-          this->weightOffset(weightName), outputBuffer, outputOffset,
-          inputSize, outputSize);
-      return;
+      batch->matvecmul(workspace.buffer, inputOffset, weight.buffer, weight.offset, outputBuffer, outputOffset, inputSize, outputSize);
+    } else {
+      matvecmul_metal(this->metal_context, workspace.buffer, inputOffset, weight.buffer, weight.offset, outputBuffer, outputOffset, inputSize, outputSize);
     }
-    matvecmul_metal(
-        this->metal_context, workspace.buffer, inputOffset,
-        this->model_buffer, this->weightOffset(weightName), workspace.buffer,
-        outputOffset, inputSize, outputSize);
-    return;
+  } else {
+    matmul_metal(this->metal_context, workspace.buffer, inputOffset, MatMulFlag::NO_TRANSPOSE, weight.buffer, weight.offset, MatMulFlag::TRANSPOSE, outputBuffer, outputOffset, sequenceLength, inputSize, outputSize, true);
   }
 
-  matmul_metal(
-      this->metal_context, workspace.buffer, inputOffset,
-      MatMulFlag::NO_TRANSPOSE, this->model_buffer,
-      this->weightOffset(weightName), MatMulFlag::TRANSPOSE,
-      workspace.buffer, outputOffset, sequenceLength, inputSize,
-      outputSize, true);
+  auto active = this->active_perturbations.find(weightOffset);
+  if (active != this->active_perturbations.end()) {
+    if (batch != nullptr) {
+      throw std::logic_error(
+          "Perturbed forward does not support command batching");
+    }
+    const eggroll::EGGROLLPerturbation &perturbation = *active->second;
+    if (perturbation.M != inputSize || perturbation.N != outputSize) {
+      throw std::invalid_argument(
+          "EGGROLL perturbation dimensions do not match the matrix");
+    }
+    eggroll::applyPerturbationMetal(
+        this->metal_context, workspace.buffer, inputOffset,
+        outputBuffer, outputOffset, perturbation,
+        sequenceLength, this->active_epsilon);
+    this->applied_perturbations.insert(weightOffset);
+  }
 }
 
 std::size_t Model::forwardBlock(Workspace &workspace,
@@ -217,55 +346,59 @@ std::size_t Model::forwardBlock(Workspace &workspace,
                                 std::size_t blockIndex, KVCache *cache,
                                 std::size_t cachePosition,
                                 MetalCommandBatch *batch,
-                                bool parallelHeads) {
+                                bool parallelHeads,
+                                std::size_t batchSize) {
   std::string block = std::format("blocks.{}", blockIndex);
   std::size_t numHeads = std::get<std::uint64_t>(
       this->parameters.metadata("gptscratch.attention.head_count"));
   std::size_t headSize = this->input_size / numHeads;
-  std::size_t elementCount = sequenceLength * this->input_size;
-  std::size_t elementsPerHead = sequenceLength * headSize;
+  std::size_t rowCount = batchSize * sequenceLength;
+  std::size_t elementCount = rowCount * this->input_size;
+  std::size_t elementsPerHead = rowCount * headSize;
+  WeightBinding ln1Gamma = this->resolveWeight(this->weightOffset(block + ".ln1.weight"));
+  WeightBinding ln1Beta = this->resolveWeight(this->weightOffset(block + ".ln1.bias"));
 
   if (batch == nullptr) {
-    layer_norm_metal(
-        this->metal_context, workspace.buffer, inputOffset,
-        this->model_buffer, this->weightOffset(block + ".ln1.weight"),
-        this->model_buffer, this->weightOffset(block + ".ln1.bias"),
-        workspace.buffer, workspace.residualOffset, sequenceLength,
-        this->input_size);
+    layer_norm_metal(this->metal_context, workspace.buffer, inputOffset, ln1Gamma.buffer, ln1Gamma.offset, ln1Beta.buffer, ln1Beta.offset, workspace.buffer, workspace.residualOffset, rowCount, this->input_size);
   } else {
-    batch->layerNorm(
-        workspace.buffer, inputOffset, this->model_buffer,
-        this->weightOffset(block + ".ln1.weight"), this->model_buffer,
-        this->weightOffset(block + ".ln1.bias"), workspace.buffer,
-        workspace.residualOffset, sequenceLength, this->input_size);
+    batch->layerNorm(workspace.buffer, inputOffset, ln1Gamma.buffer, ln1Gamma.offset, ln1Beta.buffer, ln1Beta.offset, workspace.buffer, workspace.residualOffset, rowCount, this->input_size);
   }
 
   if (parallelHeads) {
-    if (batch == nullptr || cache == nullptr || sequenceLength != 1) {
+    if (batch == nullptr || cache == nullptr || sequenceLength != 1 || batchSize != 1) {
       throw std::invalid_argument(
           "Parallel heads require one cached command batch");
     }
     std::vector<std::size_t> queryWeightOffsets;
     std::vector<std::size_t> keyWeightOffsets;
     std::vector<std::size_t> valueWeightOffsets;
+    std::vector<MTL::Buffer *> queryWeightBuffers;
+    std::vector<MTL::Buffer *> keyWeightBuffers;
+    std::vector<MTL::Buffer *> valueWeightBuffers;
     std::vector<std::size_t> queryOutputOffsets;
     std::vector<std::size_t> keyOutputOffsets;
     std::vector<std::size_t> valueOutputOffsets;
     queryWeightOffsets.reserve(numHeads);
     keyWeightOffsets.reserve(numHeads);
     valueWeightOffsets.reserve(numHeads);
+    queryWeightBuffers.reserve(numHeads);
+    keyWeightBuffers.reserve(numHeads);
+    valueWeightBuffers.reserve(numHeads);
     queryOutputOffsets.reserve(numHeads);
     keyOutputOffsets.reserve(numHeads);
     valueOutputOffsets.reserve(numHeads);
     for (std::size_t head = 0; head < numHeads; head++) {
       std::string headPrefix =
           std::format("{}.sa.heads.{}.", block, head);
-      queryWeightOffsets.push_back(
-          this->weightOffset(headPrefix + "query.weight"));
-      keyWeightOffsets.push_back(
-          this->weightOffset(headPrefix + "key.weight"));
-      valueWeightOffsets.push_back(
-          this->weightOffset(headPrefix + "value.weight"));
+      WeightBinding queryWeight = this->resolveWeight(this->weightOffset(headPrefix + "query.weight"));
+      WeightBinding keyWeight = this->resolveWeight(this->weightOffset(headPrefix + "key.weight"));
+      WeightBinding valueWeight = this->resolveWeight(this->weightOffset(headPrefix + "value.weight"));
+      queryWeightBuffers.push_back(queryWeight.buffer);
+      keyWeightBuffers.push_back(keyWeight.buffer);
+      valueWeightBuffers.push_back(valueWeight.buffer);
+      queryWeightOffsets.push_back(queryWeight.offset);
+      keyWeightOffsets.push_back(keyWeight.offset);
+      valueWeightOffsets.push_back(valueWeight.offset);
       queryOutputOffsets.push_back(
           workspace.queryOffset + head * elementsPerHead * sizeof(float));
       std::size_t cacheOffset =
@@ -273,12 +406,20 @@ std::size_t Model::forwardBlock(Workspace &workspace,
       keyOutputOffsets.push_back(cacheOffset);
       valueOutputOffsets.push_back(cacheOffset);
     }
-    batch->qkvMatvecmulHeads(
-        workspace.buffer, workspace.residualOffset, this->model_buffer,
-        queryWeightOffsets, keyWeightOffsets, valueWeightOffsets,
-        workspace.buffer, queryOutputOffsets, cache->keyBuffer(),
-        keyOutputOffsets, cache->valueBuffer(), valueOutputOffsets,
-        this->input_size, headSize);
+    MTL::Buffer *sharedWeightBuffer = queryWeightBuffers.front();
+    bool weightsShareBuffer = true;
+    for (std::size_t head = 0; head < numHeads; head++) {
+      weightsShareBuffer = weightsShareBuffer && queryWeightBuffers[head] == sharedWeightBuffer && keyWeightBuffers[head] == sharedWeightBuffer && valueWeightBuffers[head] == sharedWeightBuffer;
+    }
+    if (weightsShareBuffer) {
+      batch->qkvMatvecmulHeads(workspace.buffer, workspace.residualOffset, sharedWeightBuffer, queryWeightOffsets, keyWeightOffsets, valueWeightOffsets, workspace.buffer, queryOutputOffsets, cache->keyBuffer(), keyOutputOffsets, cache->valueBuffer(), valueOutputOffsets, this->input_size, headSize);
+    } else {
+      for (std::size_t head = 0; head < numHeads; head++) {
+        batch->matvecmul(workspace.buffer, workspace.residualOffset, queryWeightBuffers[head], queryWeightOffsets[head], workspace.buffer, queryOutputOffsets[head], this->input_size, headSize);
+        batch->matvecmul(workspace.buffer, workspace.residualOffset, keyWeightBuffers[head], keyWeightOffsets[head], cache->keyBuffer(), keyOutputOffsets[head], this->input_size, headSize);
+        batch->matvecmul(workspace.buffer, workspace.residualOffset, valueWeightBuffers[head], valueWeightOffsets[head], cache->valueBuffer(), valueOutputOffsets[head], this->input_size, headSize);
+      }
+    }
   } else {
     for (std::size_t head = 0; head < numHeads; head++) {
       std::string headPrefix =
@@ -286,8 +427,8 @@ std::size_t Model::forwardBlock(Workspace &workspace,
       std::size_t headOutputOffset =
           head * elementsPerHead * sizeof(float);
       this->linear(workspace, workspace.residualOffset,
-                   headPrefix + "query.weight",
-                   workspace.queryOffset + headOutputOffset, sequenceLength,
+                   this->weightOffset(headPrefix + "query.weight"),
+                   workspace.queryOffset + headOutputOffset, rowCount,
                    this->input_size, headSize, batch);
 
       MTL::Buffer *keyOutputBuffer = workspace.buffer;
@@ -302,13 +443,13 @@ std::size_t Model::forwardBlock(Workspace &workspace,
       }
 
       this->linear(workspace, workspace.residualOffset,
-                   headPrefix + "key.weight", keyOutputOffset,
-                   sequenceLength, this->input_size, headSize, batch,
+                   this->weightOffset(headPrefix + "key.weight"), keyOutputOffset,
+                   rowCount, this->input_size, headSize, batch,
                    keyOutputBuffer);
 
       this->linear(workspace, workspace.residualOffset,
-                   headPrefix + "value.weight", valueOutputOffset,
-                   sequenceLength, this->input_size, headSize, batch,
+                   this->weightOffset(headPrefix + "value.weight"), valueOutputOffset,
+                   rowCount, this->input_size, headSize, batch,
                    valueOutputBuffer);
     }
   }
@@ -328,7 +469,7 @@ std::size_t Model::forwardBlock(Workspace &workspace,
     scaled_dot_product_attention_metal(
         this->metal_context, workspace.buffer, workspace.queryOffset,
         workspace.keyOffset, workspace.valueOffset, writeOffset,
-        sequenceLength, headSize, numHeads, true, this->input_size);
+        sequenceLength, headSize, numHeads, true, this->input_size, batchSize);
   } else {
     if (batch == nullptr) {
       scaled_dot_product_attention_cached_metal(
@@ -345,21 +486,17 @@ std::size_t Model::forwardBlock(Workspace &workspace,
   }
   std::swap(readOffset, writeOffset);
 
-  this->linear(workspace, readOffset, block + ".sa.proj.weight",
-               writeOffset, sequenceLength, this->input_size,
+  this->linear(workspace, readOffset,
+               this->weightOffset(block + ".sa.proj.weight"),
+               writeOffset, rowCount, this->input_size,
                this->input_size, batch);
   std::swap(readOffset, writeOffset);
+  WeightBinding projectionBias = this->resolveWeight(this->weightOffset(block + ".sa.proj.bias"));
 
   if (batch == nullptr) {
-    add_bias_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer, this->weightOffset(block + ".sa.proj.bias"),
-        workspace.buffer, writeOffset, elementCount, this->input_size);
+    add_bias_metal(this->metal_context, workspace.buffer, readOffset, projectionBias.buffer, projectionBias.offset, workspace.buffer, writeOffset, elementCount, this->input_size);
   } else {
-    batch->addBias(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset(block + ".sa.proj.bias"), workspace.buffer,
-        writeOffset, elementCount, this->input_size);
+    batch->addBias(workspace.buffer, readOffset, projectionBias.buffer, projectionBias.offset, workspace.buffer, writeOffset, elementCount, this->input_size);
   }
   std::swap(readOffset, writeOffset);
 
@@ -372,40 +509,27 @@ std::size_t Model::forwardBlock(Workspace &workspace,
                        readOffset, writeOffset, elementCount);
   }
   std::swap(readOffset, writeOffset);
+  WeightBinding ln2Gamma = this->resolveWeight(this->weightOffset(block + ".ln2.weight"));
+  WeightBinding ln2Beta = this->resolveWeight(this->weightOffset(block + ".ln2.bias"));
 
   if (batch == nullptr) {
-    layer_norm_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer, this->weightOffset(block + ".ln2.weight"),
-        this->model_buffer, this->weightOffset(block + ".ln2.bias"),
-        workspace.buffer, workspace.residualOffset, sequenceLength,
-        this->input_size);
+    layer_norm_metal(this->metal_context, workspace.buffer, readOffset, ln2Gamma.buffer, ln2Gamma.offset, ln2Beta.buffer, ln2Beta.offset, workspace.buffer, workspace.residualOffset, rowCount, this->input_size);
   } else {
-    batch->layerNorm(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset(block + ".ln2.weight"), this->model_buffer,
-        this->weightOffset(block + ".ln2.bias"), workspace.buffer,
-        workspace.residualOffset, sequenceLength, this->input_size);
+    batch->layerNorm(workspace.buffer, readOffset, ln2Gamma.buffer, ln2Gamma.offset, ln2Beta.buffer, ln2Beta.offset, workspace.buffer, workspace.residualOffset, rowCount, this->input_size);
   }
 
   std::size_t feedForwardSize = this->input_size * 4;
-  std::size_t hiddenElementCount = sequenceLength * feedForwardSize;
+  std::size_t hiddenElementCount = rowCount * feedForwardSize;
   this->linear(workspace, workspace.residualOffset,
-               block + ".ffwd.net.0.weight", writeOffset,
-               sequenceLength, this->input_size, feedForwardSize, batch);
+               this->weightOffset(block + ".ffwd.net.0.weight"), writeOffset,
+               rowCount, this->input_size, feedForwardSize, batch);
   std::swap(readOffset, writeOffset);
+  WeightBinding feedForwardInputBias = this->resolveWeight(this->weightOffset(block + ".ffwd.net.0.bias"));
 
   if (batch == nullptr) {
-    add_bias_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer,
-        this->weightOffset(block + ".ffwd.net.0.bias"), workspace.buffer,
-        writeOffset, hiddenElementCount, feedForwardSize);
+    add_bias_metal(this->metal_context, workspace.buffer, readOffset, feedForwardInputBias.buffer, feedForwardInputBias.offset, workspace.buffer, writeOffset, hiddenElementCount, feedForwardSize);
   } else {
-    batch->addBias(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset(block + ".ffwd.net.0.bias"), workspace.buffer,
-        writeOffset, hiddenElementCount, feedForwardSize);
+    batch->addBias(workspace.buffer, readOffset, feedForwardInputBias.buffer, feedForwardInputBias.offset, workspace.buffer, writeOffset, hiddenElementCount, feedForwardSize);
   }
   std::swap(readOffset, writeOffset);
 
@@ -418,22 +542,17 @@ std::size_t Model::forwardBlock(Workspace &workspace,
   }
   std::swap(readOffset, writeOffset);
 
-  this->linear(workspace, readOffset, block + ".ffwd.net.2.weight",
-               writeOffset, sequenceLength, feedForwardSize,
+  this->linear(workspace, readOffset,
+               this->weightOffset(block + ".ffwd.net.2.weight"),
+               writeOffset, rowCount, feedForwardSize,
                this->input_size, batch);
   std::swap(readOffset, writeOffset);
+  WeightBinding feedForwardOutputBias = this->resolveWeight(this->weightOffset(block + ".ffwd.net.2.bias"));
 
   if (batch == nullptr) {
-    add_bias_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer,
-        this->weightOffset(block + ".ffwd.net.2.bias"), workspace.buffer,
-        writeOffset, elementCount, this->input_size);
+    add_bias_metal(this->metal_context, workspace.buffer, readOffset, feedForwardOutputBias.buffer, feedForwardOutputBias.offset, workspace.buffer, writeOffset, elementCount, this->input_size);
   } else {
-    batch->addBias(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset(block + ".ffwd.net.2.bias"), workspace.buffer,
-        writeOffset, elementCount, this->input_size);
+    batch->addBias(workspace.buffer, readOffset, feedForwardOutputBias.buffer, feedForwardOutputBias.offset, workspace.buffer, writeOffset, elementCount, this->input_size);
   }
   std::swap(readOffset, writeOffset);
 
@@ -460,38 +579,25 @@ std::size_t Model::finish(Workspace &workspace, std::size_t inputOffset,
       inputOffset == workspace.scratchAOffset
           ? workspace.scratchBOffset
           : workspace.scratchAOffset;
+  WeightBinding finalGamma = this->resolveWeight(this->weightOffset(finalLayerNorm + ".weight"));
+  WeightBinding finalBeta = this->resolveWeight(this->weightOffset(finalLayerNorm + ".bias"));
 
   if (batch == nullptr) {
-    layer_norm_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer,
-        this->weightOffset(finalLayerNorm + ".weight"), this->model_buffer,
-        this->weightOffset(finalLayerNorm + ".bias"), workspace.buffer,
-        writeOffset, sequenceLength, this->input_size);
+    layer_norm_metal(this->metal_context, workspace.buffer, readOffset, finalGamma.buffer, finalGamma.offset, finalBeta.buffer, finalBeta.offset, workspace.buffer, writeOffset, sequenceLength, this->input_size);
   } else {
-    batch->layerNorm(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset(finalLayerNorm + ".weight"), this->model_buffer,
-        this->weightOffset(finalLayerNorm + ".bias"), workspace.buffer,
-        writeOffset, sequenceLength, this->input_size);
+    batch->layerNorm(workspace.buffer, readOffset, finalGamma.buffer, finalGamma.offset, finalBeta.buffer, finalBeta.offset, workspace.buffer, writeOffset, sequenceLength, this->input_size);
   }
   std::swap(readOffset, writeOffset);
 
-  this->linear(workspace, readOffset, "lm_head.weight", writeOffset,
+  this->linear(workspace, readOffset, this->weightOffset("lm_head.weight"), writeOffset,
                sequenceLength, this->input_size, this->output_size, batch);
   std::swap(readOffset, writeOffset);
+  WeightBinding languageModelBias = this->resolveWeight(this->weightOffset("lm_head.bias"));
 
   if (batch == nullptr) {
-    add_bias_metal(
-        this->metal_context, workspace.buffer, readOffset,
-        this->model_buffer, this->weightOffset("lm_head.bias"),
-        workspace.buffer, writeOffset, sequenceLength * this->output_size,
-        this->output_size);
+    add_bias_metal(this->metal_context, workspace.buffer, readOffset, languageModelBias.buffer, languageModelBias.offset, workspace.buffer, writeOffset, sequenceLength * this->output_size, this->output_size);
   } else {
-    batch->addBias(
-        workspace.buffer, readOffset, this->model_buffer,
-        this->weightOffset("lm_head.bias"), workspace.buffer, writeOffset,
-        sequenceLength * this->output_size, this->output_size);
+    batch->addBias(workspace.buffer, readOffset, languageModelBias.buffer, languageModelBias.offset, workspace.buffer, writeOffset, sequenceLength * this->output_size, this->output_size);
   }
   std::swap(readOffset, writeOffset);
 
@@ -501,20 +607,24 @@ std::size_t Model::finish(Workspace &workspace, std::size_t inputOffset,
 float *Model::execute(const int *tokens, std::size_t sequenceLength,
                       std::size_t startPosition, KVCache *cache,
                       std::size_t cachePosition, bool singleCommand,
-                      bool parallelHeads) {
+                      bool parallelHeads, std::size_t batchSize) {
   if (!this->loaded()) {
     throw std::runtime_error("Load model weights before inference");
   }
-  Workspace workspace = this->allocateWorkspace(sequenceLength);
+  if (batchSize == 0 || sequenceLength == 0 || (batchSize > 1 && (startPosition != 0 || cache != nullptr))) {
+    throw std::invalid_argument("Model batch dimensions are invalid");
+  }
+  std::size_t rowCount = batchSize * sequenceLength;
+  Workspace workspace = this->allocateWorkspace(rowCount);
   float *embeddings = nullptr;
   try {
-    embeddings = this->embedAt(tokens, sequenceLength, startPosition);
+    embeddings = batchSize == 1 ? this->embedAt(tokens, sequenceLength, startPosition) : this->embedBatch(tokens, batchSize, sequenceLength);
     write_metal_buffer(workspace.buffer, workspace.scratchAOffset,
-                       embeddings, sequenceLength * this->input_size);
+                       embeddings, rowCount * this->input_size);
     std::free(embeddings);
     embeddings = nullptr;
 
-    if (singleCommand && (sequenceLength != 1 || cache == nullptr)) {
+    if (singleCommand && (sequenceLength != 1 || cache == nullptr || batchSize != 1)) {
       throw std::invalid_argument(
           "Single-command execution requires one cached token");
     }
@@ -533,17 +643,17 @@ float *Model::execute(const int *tokens, std::size_t sequenceLength,
     for (std::size_t block = 0; block < blockCount; block++) {
       outputOffset = this->forwardBlock(
           workspace, outputOffset, sequenceLength, block, cache,
-          cachePosition, batch.get(), parallelHeads);
+          cachePosition, batch.get(), parallelHeads, batchSize);
     }
 
-    outputOffset = this->finish(workspace, outputOffset, sequenceLength,
+    outputOffset = this->finish(workspace, outputOffset, rowCount,
                                 batch.get());
     if (batch != nullptr) {
       batch->commitAndWait();
     }
     float *result = read_metal_buffer(
         workspace.buffer, outputOffset,
-        sequenceLength * this->output_size);
+        rowCount * this->output_size);
     release_metal_buffer(workspace.buffer);
     return result;
   } catch (...) {
@@ -555,6 +665,162 @@ float *Model::execute(const int *tokens, std::size_t sequenceLength,
 
 float *Model::forward(const int *tokens, unsigned int sequenceLength) {
   return this->execute(tokens, sequenceLength, 0, nullptr, 0);
+}
+
+float *Model::forwardBatch(const int *tokens, std::size_t batchSize, std::size_t sequenceLength) {
+  return this->execute(tokens, sequenceLength, 0, nullptr, 0, false, false, batchSize);
+}
+
+float *Model::forwardPerturbed(
+    const int *tokens, std::size_t sequenceLength,
+    std::size_t targetWeightOffset,
+    const eggroll::EGGROLLPerturbation &perturbation,
+    float epsilon) {
+  if (!this->active_perturbations.empty()) {
+    throw std::logic_error("A perturbed forward pass is already active");
+  }
+  this->active_perturbations.emplace(targetWeightOffset, &perturbation);
+  this->active_epsilon = epsilon;
+  return this->executePerturbed(tokens, sequenceLength);
+}
+
+float *Model::forwardPerturbed(
+    const int *tokens, std::size_t sequenceLength,
+    const eggroll::EGGROLLCandidate &candidate, float epsilon) {
+  if (!this->active_perturbations.empty()) {
+    throw std::logic_error("A perturbed forward pass is already active");
+  }
+  if (candidate.empty()) {
+    throw std::invalid_argument("An EGGROLL candidate cannot be empty");
+  }
+  for (const eggroll::EGGROLLTarget &target : candidate) {
+    if (!this->active_perturbations
+             .emplace(target.weightOffset, &target.perturbation)
+             .second) {
+      this->active_perturbations.clear();
+      throw std::invalid_argument(
+          "An EGGROLL candidate contains a duplicate weight offset");
+    }
+  }
+  this->active_epsilon = epsilon;
+  return this->executePerturbed(tokens, sequenceLength);
+}
+
+float *Model::forwardPerturbedBatch(const int *tokens, std::size_t batchSize, std::size_t sequenceLength, const eggroll::EGGROLLCandidate &candidate, float epsilon) {
+  if (!this->active_perturbations.empty()) {
+    throw std::logic_error("A perturbed forward pass is already active");
+  }
+  if (candidate.empty()) {
+    throw std::invalid_argument("An EGGROLL candidate cannot be empty");
+  }
+  for (const eggroll::EGGROLLTarget &target : candidate) {
+    if (!this->active_perturbations.emplace(target.weightOffset, &target.perturbation).second) {
+      this->active_perturbations.clear();
+      throw std::invalid_argument("An EGGROLL candidate contains a duplicate weight offset");
+    }
+  }
+  this->active_epsilon = epsilon;
+  return this->executePerturbedBatch(tokens, batchSize, sequenceLength);
+}
+
+float *Model::executePerturbed(const int *tokens,
+                               std::size_t sequenceLength) {
+  return this->executePerturbedBatch(tokens, 1, sequenceLength);
+}
+
+float *Model::executePerturbedBatch(const int *tokens, std::size_t batchSize, std::size_t sequenceLength) {
+  this->applied_perturbations.clear();
+
+  float *result = nullptr;
+  try {
+    result = this->execute(tokens, sequenceLength, 0, nullptr, 0, false, false, batchSize);
+  } catch (...) {
+    this->active_perturbations.clear();
+    this->applied_perturbations.clear();
+    this->active_epsilon = 0.0F;
+    throw;
+  }
+
+  bool applied = this->applied_perturbations.size() ==
+                 this->active_perturbations.size();
+  this->active_perturbations.clear();
+  this->applied_perturbations.clear();
+  this->active_epsilon = 0.0F;
+  if (!applied) {
+    std::free(result);
+    throw std::invalid_argument(
+        "An EGGROLL target offset is not used by a linear matrix");
+  }
+  return result;
+}
+
+float Model::fitness(const float *logits, const int *targets,
+                     std::size_t sequenceLength) {
+  return eggroll::fitnessMetal(this->metal_context, logits, targets,
+                               sequenceLength, this->output_size);
+}
+
+std::vector<eggroll::EGGROLLMatrix> Model::linearMatrices() const {
+  std::vector<eggroll::EGGROLLMatrix> matrices;
+  matrices.reserve(this->linear_matrices.size());
+  for (const auto &[offset, matrix] : this->linear_matrices) {
+    matrices.push_back(matrix);
+  }
+  std::sort(matrices.begin(), matrices.end(),
+            [](const eggroll::EGGROLLMatrix &left,
+               const eggroll::EGGROLLMatrix &right) {
+              return left.weightOffset < right.weightOffset;
+            });
+  return matrices;
+}
+
+void Model::applyEGGROLLUpdate(
+    const std::vector<eggroll::EGGROLLCandidate> &population,
+    const std::vector<float> &fitnesses, float learningRate) {
+  if (!this->loaded()) {
+    throw std::runtime_error("Load model weights before an EGGROLL update");
+  }
+  if (population.empty() || population.front().empty() ||
+      population.size() != fitnesses.size()) {
+    throw std::invalid_argument("EGGROLL update population is invalid");
+  }
+
+  const eggroll::EGGROLLCandidate &first = population.front();
+  std::unordered_set<std::size_t> updatedOffsets;
+  for (const eggroll::EGGROLLTarget &firstTarget : first) {
+    if (!updatedOffsets.insert(firstTarget.weightOffset).second) {
+      throw std::invalid_argument(
+          "An EGGROLL candidate contains a duplicate weight offset");
+    }
+    auto matrix = this->linear_matrices.find(firstTarget.weightOffset);
+    if (matrix == this->linear_matrices.end() ||
+        matrix->second.M != firstTarget.perturbation.M ||
+        matrix->second.N != firstTarget.perturbation.N) {
+      throw std::invalid_argument(
+          "An EGGROLL update does not match a model matrix");
+    }
+    std::vector<const eggroll::EGGROLLPerturbation *> perturbations;
+    perturbations.reserve(population.size());
+    for (const eggroll::EGGROLLCandidate &candidate : population) {
+      if (candidate.size() != first.size()) {
+        throw std::invalid_argument(
+            "EGGROLL candidates target different weight offsets");
+      }
+      auto target = std::find_if(
+          candidate.begin(), candidate.end(),
+          [&firstTarget](const eggroll::EGGROLLTarget &value) {
+            return value.weightOffset == firstTarget.weightOffset;
+          });
+      if (target == candidate.end()) {
+        throw std::invalid_argument(
+            "EGGROLL candidates target different weight offsets");
+      }
+      perturbations.push_back(&target->perturbation);
+    }
+    WeightBinding weight = this->resolveWeight(firstTarget.weightOffset);
+    eggroll::updateWeightsMetal(this->metal_context, weight.buffer, weight.offset, perturbations, fitnesses, learningRate);
+  }
+  this->resetCache();
 }
 
 void Model::ensureCache() {
